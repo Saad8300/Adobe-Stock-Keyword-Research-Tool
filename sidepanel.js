@@ -47,6 +47,11 @@ const btnExport        = $('btnExport');
 
 const progressLabel    = $('progressLabel');
 const progressBar      = $('progressBar');
+const videoProgressHeader = $('videoProgressHeader');
+const videoProgressLabel  = $('videoProgressLabel');
+const videoProgressPct    = $('videoProgressPct');
+const videoProgressWrap   = $('videoProgressWrap');
+const videoProgressBar    = $('videoProgressBar');
 const cntQualified     = $('cntQualified');
 const cntSkipped       = $('cntSkipped');
 const cntErrors        = $('cntErrors');
@@ -63,6 +68,7 @@ const footerStatus     = $('footerStatus');
 // ══════════════════════════════════════════════════════════════
 let currentStatus   = 'idle';   // mirrors background state machine
 let collectedResults = [];       // for Excel export
+let currentKeyword   = '';       // keyword currently being processed
 let totalKeywords    = 0;
 let processedCount   = 0;
 let qualifiedCount   = 0;
@@ -236,10 +242,26 @@ function updateProgress(processed, total, q, s, e) {
 
   const pct = totalKeywords > 0 ? (processedCount / totalKeywords) * 100 : 0;
   progressBar.style.width = `${pct}%`;
-  progressLabel.textContent = `${processedCount} / ${totalKeywords} keywords`;
+  progressLabel.textContent =
+    `${processedCount} / ${totalKeywords} keywords (${Math.round(pct)}%)`;
   cntQualified.textContent  = qualifiedCount;
   cntSkipped.textContent    = skippedCount;
   cntErrors.textContent     = errorCount;
+}
+
+function updateVideoProgress(scraped, total) {
+  if (!total || total <= 0) {
+    videoProgressHeader.style.display = 'none';
+    videoProgressWrap.style.display = 'none';
+    return;
+  }
+  videoProgressHeader.style.display = 'flex';
+  videoProgressWrap.style.display = 'block';
+
+  const pct = Math.min((scraped / total) * 100, 100);
+  videoProgressBar.style.width = `${pct}%`;
+  videoProgressLabel.textContent = `${scraped} / ${total} videos`;
+  videoProgressPct.textContent = `${Math.round(pct)}%`;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -479,6 +501,7 @@ btnStart.addEventListener('click', async () => {
   clearLog();
   clearResultsTable();
   updateProgress(0, totalKeywords, 0, 0, 0);
+  updateVideoProgress(0, 0);
   setStep('Initializing…');
   hideBanner();
   applyStatus('running');
@@ -605,6 +628,7 @@ chrome.runtime.onMessage.addListener((msg) => {
       if (collectedResults.length > 0) {
         log('📁 You can still download partial results.', 'info');
       }
+      updateVideoProgress(0, 0);
       break;
 
     case 'run_completed': {
@@ -618,6 +642,7 @@ chrome.runtime.onMessage.addListener((msg) => {
       log(`🎉 Done! ${msg.qualified} qualified, ${msg.skipped} skipped, ${msg.errors} errors.`, 'ok');
       log(`📹 Total videos scraped: ${msg.totalScraped}`, 'ok');
       log('📁 Press "Download Excel Report" to export.', 'info');
+      updateVideoProgress(0, 0);
       break;
     }
 
@@ -628,6 +653,7 @@ chrome.runtime.onMessage.addListener((msg) => {
 
     // ── Per-keyword events ────────────────────────────────────
     case 'keyword_start':
+      currentKeyword = msg.keyword;
       setStep(`Searching: "${msg.keyword}" (${msg.index + 1}/${msg.total})…`);
       log(`🔍 [${msg.index + 1}/${msg.total}] Processing: "${msg.keyword}"`, 'info');
       break;
@@ -666,17 +692,24 @@ chrome.runtime.onMessage.addListener((msg) => {
         btnExport.disabled = false;
       }
       updateProgress(processedCount, msg.total, qualifiedCount, skippedCount, errorCount);
+      updateVideoProgress(0, 0);
       break;
     }
 
     // ── Step / scrape progress ────────────────────────────────
-    case 'step':
-      setStep(msg.step);
+    case 'step': {
+      const kw = msg.keyword || currentKeyword;
+      setStep(kw ? `"${kw}" — ${msg.step}` : msg.step);
       break;
+    }
 
-    case 'scrape_progress':
-      setStep(`${msg.step || `Scraping video ${msg.scraped}/${msg.total}…`}`);
+    case 'scrape_progress': {
+      const stepText = msg.step || `Scraping video ${msg.scraped}/${msg.total}…`;
+      const kw = msg.keyword || currentKeyword;
+      setStep(kw ? `"${kw}" — ${stepText}` : stepText);
+      updateVideoProgress(msg.scraped, msg.total);
       break;
+    }
 
     // ── Generic log ───────────────────────────────────────────
     case 'log':

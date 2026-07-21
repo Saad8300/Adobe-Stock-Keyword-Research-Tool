@@ -43,13 +43,13 @@ import {
   saveState,
   clearState,
   initRun,
-  advanceKeyword,
   pauseRun,
   resumeRun,
   stopRun,
-  completeRun,
-  hasResumableSession
+  completeRun
 } from './utils/stateManager.js';
+
+import { extractAssetId, runScrapeLoop } from './utils/scrapeCore.js';
 
 // ══════════════════════════════════════════════════════════════
 // SIDE PANEL REGISTRATION
@@ -72,6 +72,7 @@ let rt = {
   settings:      {},
   results:       [],
   workingTabId:  null,     // the tab we navigate for main searches
+  detailTabId:   null,     // reused hidden tab for asset detail pages
   stopFlag:      false,    // set true by Stop action
   pauseFlag:     false,    // set true by Pause action
   keywordTimer:  null      // per-keyword timeout handle
@@ -80,6 +81,12 @@ let rt = {
 // ══════════════════════════════════════════════════════════════
 // UTILITIES
 // ══════════════════════════════════════════════════════════════
+
+// ── DEBUG INSTRUMENTATION ──────────────────────────────────────
+// Flip to false to silence the verbose service-worker trace.
+// Inspect via chrome://extensions → the extension's "service worker" console.
+const DEBUG = true;
+const dbg = (...a) => { if (DEBUG) console.log('%c[bg]', 'color:#e6000a', ...a); };
 
 /** Send a message to the side panel (best-effort; panel may be closed). */
 function notify(event, data = {}) {
@@ -90,16 +97,9 @@ function notify(event, data = {}) {
 
 /** Random delay between minMs and maxMs milliseconds. */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-/**
- * Extract the asset ID from a URL for true deduplication (ignores tracking params).
- */
-function extractAssetId(url) {
-  if (!url) return null;
-  const match = url.match(/\/(\d+)(?:\?|$)/);
-  return match ? match[1] : url; // fallback to full url if no numeric ID found
-}
 const randomDelay = (min, max) => sleep(Math.floor(Math.random() * (max - min + 1)) + min);
+// extractAssetId is imported from utils/scrapeCore.js (single source of truth,
+// shared with the unit tests).
 
 /**
  * Wait for a Chrome tab to reach 'complete' status.
@@ -199,124 +199,61 @@ async function closeWorkingTab() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// TAG FETCHING FROM DETAIL PAGES
-// Two strategies, tried in order:
-//   A. fetch() + DOMParser — fast, no extra tab
-//   B. Hidden tab — full JS rendering, slower but more reliable
+// DETAIL-PAGE SCRAPING
+// ──────────────────────────────────────────────────────────────
+// A SINGLE hidden tab is reused for every asset detail page in the
+// run. This is the only reliable way to read a React SPA's fully
+// rendered keyword list and expanded title:
+//   • plain fetch() returns pre-hydration HTML with only a partial
+//     keyword subset — that was the root cause of missing/short tags
+//     and "See More"-polluted titles in previous versions.
+//   • Reusing one tab (vs. create+destroy per video) removes the
+//     per-video 20s load wait and the tab-churn races that caused
+//     the loop to stall out at 5–6 videos.
+// content.js does the DOM work (expand + verify + extract) and
+// returns { assetId, title, tags, targetTagCount }.
 // ══════════════════════════════════════════════════════════════
 
-/**
- * Try to extract tags and title from a detail page URL.
- * @param {string} url — full URL of the asset detail page
- * @returns {Promise<{tags: string[], title: string}>}
- */
-async function fetchTagsFromDetailPage(url) {
-  // ── Strategy A: plain fetch ──────────────────────────────────
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9'
-      },
-      credentials: 'omit'
-    });
-    if (res.ok) {
-      const html = await res.text();
-      const tags = parseTagsFromHtml(html);
-      
-      let title = '';
-      try {
-        // DOMParser is available in MV3 service workers only in very new Chrome versions,
-        // but we'll try basic regex fallback if DOMParser fails.
-        // Wait, DOMParser is NOT available in SW! 
-        // We'll just rely on Strategy B for title or use regex.
-        const match = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
-        if (match) title = match[1].trim();
-      } catch (_) {}
-
-      if (tags.length > 0) {
-        console.log(`[bg] fetch() got ${tags.length} tags from ${url}`);
-        return { tags, title, targetTagCount: null };
-      }
-      // Zero tags from static parse — fall through to tab method
-    }
-  } catch (e) {
-    console.warn('[bg] fetch() for tags failed:', e.message, '— trying hidden tab');
+/** Ensure the reusable detail tab exists (create if missing/closed). */
+async function ensureDetailTab() {
+  if (rt.detailTabId != null) {
+    try { await chrome.tabs.get(rt.detailTabId); return; }
+    catch (_) { rt.detailTabId = null; }
   }
+  const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+  rt.detailTabId = tab.id;
+  dbg('created detail tab', rt.detailTabId);
+}
 
-  // ── Strategy B: hidden tab ────────────────────────────────────
-  return fetchTagsViaHiddenTab(url);
+/** Close the reusable detail tab. */
+async function closeDetailTab() {
+  if (rt.detailTabId != null) {
+    try { await chrome.tabs.remove(rt.detailTabId); } catch (_) {}
+    rt.detailTabId = null;
+  }
 }
 
 /**
- * Parse tags from raw HTML string. Service workers don't have DOMParser.
+ * Navigate the reused detail tab to an asset URL and extract its
+ * title + full tag list from the rendered DOM.
+ * @param {string} url — full asset detail URL
+ * @returns {Promise<{assetId:string, title:string, tags:string[], targetTagCount:number|null}>}
  */
-function parseTagsFromHtml(html) {
-  const tags = new Set();
-  
-  // Basic regex fallback since DOMParser isn't in Service Worker
-  // (We primarily rely on hidden tab for accuracy anyway)
-  const metaMatch = html.match(/<meta\s+name="keywords"\s+content="([^"]+)"/i);
-  if (metaMatch) {
-    metaMatch[1].split(',').forEach(k => {
-      const t = k.trim();
-      if (t) tags.add(t);
-    });
-  }
+async function scrapeDetailPage(url) {
+  await ensureDetailTab();
+  await chrome.tabs.update(rt.detailTabId, { url });
+  await waitForTabLoad(rt.detailTabId, 30000);
+  await sleep(1000); // brief settle before content.js begins its own waits
 
-  // Look for JSON-LD structured data
-  const jsonLdRegex = /<script\s+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
-  let match;
-  while ((match = jsonLdRegex.exec(html)) !== null) {
-    try {
-      const data = JSON.parse(match[1]);
-      extractJsonLdTags(data, tags);
-    } catch (_) {}
-  }
+  const resp = await sendToContent(rt.detailTabId, { action: 'get_detail_data' }, 3);
+  if (resp?.error) throw new Error(resp.error);
 
-  return [...tags];
-}
-
-function extractJsonLdTags(data, tagSet) {
-  if (!data) return;
-  if (data.keywords) {
-    const kws = Array.isArray(data.keywords) ? data.keywords : String(data.keywords).split(',');
-    kws.forEach(k => { const t = k.trim(); if (t) tagSet.add(t); });
-  }
-  if (data.about) {
-    (Array.isArray(data.about) ? data.about : [data.about])
-      .forEach(item => { if (item?.name) tagSet.add(item.name.trim()); });
-  }
-  if (data['@graph']) data['@graph'].forEach(n => extractJsonLdTags(n, tagSet));
-}
-
-/**
- * Open a hidden tab, wait for it to load, message content.js to
- * scrape tags, then close the tab.
- */
-async function fetchTagsViaHiddenTab(url) {
-  let tabId = null;
-  try {
-    const tab = await chrome.tabs.create({ url, active: false });
-    tabId = tab.id;
-    await waitForTabLoad(tabId, 20000);
-    await sleep(1200); // let React finish
-
-    const resp = await sendToContent(tabId, { action: 'get_detail_tags' }, 3);
-    return {
-      tags: (resp && Array.isArray(resp.tags)) ? resp.tags : [],
-      title: resp?.title || '',
-      targetTagCount: resp?.targetTagCount || null
-    };
-  } catch (e) {
-    console.warn('[bg] Hidden tab tag fetch failed:', e.message);
-    return { tags: [], title: '' };
-  } finally {
-    if (tabId) {
-      try { await chrome.tabs.remove(tabId); } catch (_) {}
-    }
-  }
+  return {
+    assetId:        resp?.assetId || extractAssetId(url),
+    title:          resp?.title || '',
+    tags:           Array.isArray(resp?.tags) ? resp.tags : [],
+    targetTagCount: resp?.targetTagCount ?? null
+  };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -350,50 +287,43 @@ async function processKeyword(keyword, index, total) {
 
   notify('keyword_start', { keyword, index, total });
 
-  // Per-keyword hard timeout — wraps the entire processing block
-  let keywordTimedOut = false;
-  const timeoutHandle = setTimeout(() => {
-    keywordTimedOut = true;
-  }, 45000); // 45 seconds
+  // ── Two-phase deadlines (replaces the old blunt 45s cap) ─────────
+  // The setup phase (navigate + verify + count) is quick and gets a
+  // fixed budget. Scraping N detail pages is inherently sequential, so
+  // its budget SCALES with videoCount. The fixed 45s cap was the direct
+  // cause of the "only 5/10 videos" bug: it fired mid-scrape and killed
+  // legitimate in-progress work.
+  const setupDeadline  = Date.now() + 60000;
+  const scrapeBudgetMs = Math.max(90000, videoCount * 30000);
 
   try {
     // ── STEP 1+2: Navigate with filters already in the URL ────────
-    // This combines "apply filters" and "navigate" into one shot.
-    // The URL encodes: video content type + most downloaded sort.
     const filteredUrl = buildFilteredUrl(keyword);
     notify('step', { keyword, step: 'Navigating to filtered results…' });
-    notify('log', { message: `  → ${filteredUrl}`, type: 'muted' });
+    dbg(`keyword "${keyword}" → ${filteredUrl}`);
 
     await navigateWorkingTab(filteredUrl);
-
-    if (keywordTimedOut) throw new Error('Keyword timed out during navigation');
+    if (Date.now() > setupDeadline) throw new Error('Timed out during navigation');
 
     // ── STEP 3: Verify URL filter was honoured ─────────────────────
-    // Some traffic configurations may strip the filter params.
-    // The content script will verify and optionally click fallback UI.
     notify('step', { keyword, step: 'Verifying filters applied…' });
-    const verifyResp = await sendToContent(rt.workingTabId, {
-      action: 'verify_and_fix_filters'
-    });
-
+    const verifyResp = await sendToContent(rt.workingTabId, { action: 'verify_and_fix_filters' });
     if (verifyResp?.navigatedTo) {
-      // Content script triggered a URL fix — wait for reload
       await waitForTabLoad(rt.workingTabId, 25000);
       await sleep(1500);
     }
-
-    if (keywordTimedOut) throw new Error('Keyword timed out during filter verification');
+    if (Date.now() > setupDeadline) throw new Error('Timed out during filter verification');
 
     // ── STEP 4: Read competition count ─────────────────────────────
     notify('step', { keyword, step: 'Reading competition count…' });
     const countResp = await sendToContent(rt.workingTabId, { action: 'get_result_count' });
-
     if (!countResp || countResp.error) {
       throw new Error(countResp?.error || 'No response from content script (get_result_count)');
     }
 
     const count = countResp.count;
     result.competitionCount = count;
+    dbg(`competition count for "${keyword}" = ${count}`);
     notify('competition_found', { keyword, count });
 
     // ── STEP 5: Compare against range ─────────────────────────────
@@ -414,131 +344,72 @@ async function processKeyword(keyword, index, total) {
     result.status = 'qualified';
     notify('keyword_qualified', { keyword, count });
 
-    if (keywordTimedOut) throw new Error('Keyword timed out before scraping');
+    // ── STEP 6 & 7: Scrape N unique videos + full tags ─────────────
+    // The dedupe / retry / termination logic lives in the shared,
+    // unit-tested runScrapeLoop(). Here we only wire up the real I/O:
+    // grid scraping (working tab) and detail scraping (reused hidden tab).
+    dbg(`scrape start: need ${videoCount}, budget ${Math.round(scrapeBudgetMs / 1000)}s`);
 
-    // ── STEP 6 & 7: Scrape videos and fetch tags ───────────
-    const videos = [];
-    let failedCount = 0;
-    const processedUrls = new Set();
-    let exhaustedGrid = false;
-    let totalCardsFound = 0;
+    const loop = await runScrapeLoop({
+      videoCount,
+      deadlineMs: scrapeBudgetMs,
 
-    while (videos.length < videoCount) {
-      if (rt.stopFlag || rt.pauseFlag || keywordTimedOut) break;
-
-      const target = videoCount + failedCount;
-      notify('step', { keyword, step: `Scraping up to ${target} videos…` });
-      notify('log', { message: `[DEBUG] Iteration start: videos=${videos.length}, failed=${failedCount}, requesting=${target} unique cards.` });
-      
-      const cardsResp = await sendToContent(rt.workingTabId, {
-        action: 'scrape_video_cards',
-        videoCount: target
-      });
-
-      if (!cardsResp || cardsResp.error) {
-        throw new Error(cardsResp?.error || 'No response from content script (scrape_video_cards)');
-      }
-
-      const cards = cardsResp.cards || [];
-      totalCardsFound = cards.length;
-      
-      const newCards = cards.filter(c => {
-        const id = extractAssetId(c.detailUrl);
-        return !processedUrls.has(id);
-      });
-      
-      notify('log', { message: `[DEBUG] Found ${cards.length} cards, ${newCards.length} are genuinely new.` });
-
-      if (newCards.length === 0) {
-        // No new unique cards found on this scroll attempt.
-        notify('log', { message: `[DEBUG] Exhausted grid. No new unique cards returned.` });
-        exhaustedGrid = true;
-        break;
-      }
-
-      for (const card of newCards) {
-        if (videos.length >= videoCount) break;
-        if (rt.stopFlag || rt.pauseFlag || keywordTimedOut) break;
-
-        const assetId = extractAssetId(card.detailUrl);
-        processedUrls.add(assetId);
-        const currentNum = videos.length + 1;
-        notify('log', { message: `[DEBUG] Processing video ID ${assetId} (${currentNum}/${videoCount})` });
-        
-        notify('scrape_progress', {
-          keyword,
-          scraped: videos.length,
-          total: videoCount,
-          step: `Fetching tags for video ${currentNum}/${videoCount}…`
+      // Load the grid and return its cards (content.js dedupes internally too).
+      fetchCards: async (target) => {
+        notify('step', { keyword, step: `Loading result grid (need ${videoCount})…` });
+        const cardsResp = await sendToContent(rt.workingTabId, {
+          action: 'scrape_video_cards', videoCount: target
         });
-
-        let tags = [];
-        let fullTitle = card.title || `Video ${currentNum}`;
-        let success = false;
-        
-        if (card.detailUrl) {
-          try {
-            // Promise.race to ensure we don't hang indefinitely on one detail page
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Detail page fetch timeout (25s)')), 25000));
-            const detailData = await Promise.race([
-              fetchTagsFromDetailPage(card.detailUrl),
-              timeoutPromise
-            ]);
-            
-            tags = detailData.tags;
-            if (detailData.title) fullTitle = detailData.title;
-            
-            if (detailData.targetTagCount && tags.length < detailData.targetTagCount) {
-              notify('log', {
-                message: `  ⚠ Partial tags: ${tags.length}/${detailData.targetTagCount} captured for "${fullTitle}"`,
-                type: 'skip'
-              });
-            }
-            success = true;
-          } catch (e) {
-            notify('log', {
-              message: `  ⚠ Tag fetch failed for "${fullTitle}": ${e.message}`,
-              type: 'skip'
-            });
-            failedCount++;
-          }
-          await randomDelay(800, 2000);
-        } else {
-          failedCount++;
+        if (!cardsResp || cardsResp.error) {
+          throw new Error(cardsResp?.error || 'No response from content script (scrape_video_cards)');
         }
+        const cards = cardsResp.cards || [];
+        dbg(`grid returned ${cards.length} cards (requested ${target})`);
+        return { cards };
+      },
 
-        if (success) {
-          videos.push({ title: fullTitle, tags });
-        }
-      }
-    }
+      // Navigate the reused detail tab and extract title + full tags,
+      // guarded by a per-video hard timeout so one bad page can't hang.
+      fetchDetail: async (url) => {
+        dbg(`▶ detail ${url}`);
+        const detail = await Promise.race([
+          scrapeDetailPage(url),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('detail page timeout (30s)')), 30000))
+        ]);
+        dbg(`  ◀ id=${detail.assetId} title="${detail.title}" tags=${detail.tags.length}` +
+            (detail.targetTagCount ? `/${detail.targetTagCount}` : ''));
+        return detail;
+      },
 
+      onProgress: (p) => notify('scrape_progress', { keyword, ...p }),
+      onLog:      (l) => notify('log', { message: '  ⚠ ' + l.message, type: l.type }),
+      shouldStop: () => rt.stopFlag || rt.pauseFlag,
+      interItemDelay: () => randomDelay(400, 900)
+    });
+
+    const { videos } = loop;
     notify('scrape_progress', { keyword, scraped: videos.length, total: videoCount, step: 'Done' });
-    
-    // ── VALIDATION CHECK ──────────────────────────────────────────
-    if (videos.length < videoCount) {
-      const reason = exhaustedGrid ? "no more results after max scroll" : (keywordTimedOut ? "keyword timed out" : "stopped/paused");
+
+    // ── VALIDATION ────────────────────────────────────────────────
+    if (loop.reason) {
       notify('log', {
-        message: `  ⚠ Validation: only ${videos.length}/${videoCount} unique videos found (${reason})`,
-        type: 'error'
+        message: `  ⚠ Scraped ${videos.length}/${videoCount} videos (${loop.reason})`,
+        type: videos.length > 0 ? 'skip' : 'error'
       });
-      result.skipReason = (result.skipReason ? result.skipReason + '; ' : '') + `Partial scrape: ${videos.length}/${videoCount} videos (${reason})`;
+      result.skipReason = (result.skipReason ? result.skipReason + '; ' : '') +
+        `Partial: ${videos.length}/${videoCount} videos (${loop.reason})`;
     } else {
-      notify('log', {
-        message: `  ✓ Validation: successfully scraped ${videos.length} unique videos`,
-        type: 'ok'
-      });
+      notify('log', { message: `  ✓ Scraped all ${videos.length} videos`, type: 'ok' });
     }
 
-    result.videos = videos;
+    // Store per documented schema { title, tags } (drop internal assetId).
+    result.videos = videos.map(v => ({ title: v.title, tags: v.tags }));
 
   } catch (err) {
     result.status     = 'error';
     result.skipReason = err.message;
     notify('keyword_error', { keyword, error: err.message });
-    console.error(`[bg] Error processing "${keyword}":`, err);
-  } finally {
-    clearTimeout(timeoutHandle);
+    console.error('[bg] Error processing "' + keyword + '":', err);
   }
 
   return result;
@@ -649,6 +520,7 @@ async function runAutomationLoop() {
 
   } finally {
     await closeWorkingTab();
+    await closeDetailTab();
   }
 }
 
@@ -741,7 +613,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           await clearState();
           rt = {
             status: 'idle', keywords: [], currentIndex: 0,
-            settings: {}, results: [], workingTabId: null,
+            settings: {}, results: [], workingTabId: null, detailTabId: null,
             stopFlag: false, pauseFlag: false, keywordTimer: null
           };
           sendResponse({ ok: true });

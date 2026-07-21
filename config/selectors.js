@@ -263,6 +263,36 @@ window.ADOBE_STOCK_SELECTORS = {
     'button[aria-expanded="false"][class*="keyword"]'
   ],
 
+  /**
+   * "See More" button for expanding truncated titles.
+   */
+  detailTitleExpandBtn: [
+    'button[aria-label*="See More" i]',
+    'button[class*="see-more"]',
+    'button[class*="SeeMore"]',
+    'button[aria-expanded="false"][class*="title"]',
+    '[data-cy="title-expand-button"]'
+  ],
+
+  /**
+   * "View All" button for expanding keyword tags.
+   */
+  detailTagsViewAllBtn: [
+    'button[aria-label*="View All" i]',
+    'button[class*="view-all"]',
+    'button[class*="ViewAll"]',
+    '[data-cy="tags-view-all"]'
+  ],
+
+  /**
+   * Indicator for total number of tags, e.g. "45 keywords".
+   */
+  detailTagsCountIndicator: [
+    '[data-cy="keywords-count"]',
+    '[class*="keyword-count"]',
+    '[class*="tag-count"]'
+  ],
+
   // ──────────────────────────────────────────────────────────────
   // SECTION D — UI FALLBACK SELECTORS (if URL params fail)
   // Used when Adobe Stock doesn't honour URL filter params and
@@ -327,6 +357,12 @@ window.ADOBE_STOCK_SELECTORS = {
 
     /** Max ms to wait for at least one card to appear in the grid */
     gridLoadTimeout: 25000,
+
+    /** Max ms to wait for the keyword/tag list to render on a detail page */
+    detailLoadTimeout: 12000,
+
+    /** Max ms to wait for an expand toggle (See More / View All) to take effect */
+    expandVerifyTimeout: 3500,
 
     /** Polling fallback interval (used if MutationObserver misses) */
     pollInterval: 600,

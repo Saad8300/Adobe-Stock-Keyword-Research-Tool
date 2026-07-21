@@ -47,7 +47,73 @@ function initContent() {
     return;
   }
 
-  console.log('[content] v2 initialized on:', location.href);
+  // ──────────────────────────────────────────────────────────────
+  // DEBUG INSTRUMENTATION
+  // Flip DEBUG to false to silence the verbose console trace.
+  // Every key scraping step logs here so behaviour can be verified
+  // directly in the page console (DevTools → the hidden/working tab).
+  // ──────────────────────────────────────────────────────────────
+  const DEBUG = true;
+  const dbg = (...a) => { if (DEBUG) console.log('%c[content]', 'color:#e6000a', ...a); };
+
+  dbg('v2 initialized on:', location.href);
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  /** Poll `predicate` until it returns truthy or `timeoutMs` elapses. */
+  async function waitFor(predicate, timeoutMs = 3000, stepMs = 100) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try { if (predicate()) return true; } catch (_) {}
+      await sleep(stepMs);
+    }
+    return false;
+  }
+
+  /** Wait until `counter()` stops changing for two consecutive reads. */
+  async function waitUntilStable(counter, timeoutMs = 2000, stepMs = 200) {
+    const deadline = Date.now() + timeoutMs;
+    let prev = -1, stable = 0;
+    while (Date.now() < deadline) {
+      const cur = counter();
+      if (cur === prev) { if (++stable >= 2) return cur; }
+      else { stable = 0; prev = cur; }
+      await sleep(stepMs);
+    }
+    return counter();
+  }
+
+  const isVisible = el => !!(el && el.offsetParent !== null);
+
+  /** Find the first visible <button>/link whose text matches `re`. */
+  function findButtonByText(re, root = document) {
+    const nodes = root.querySelectorAll('button, a[role="button"], [role="button"], a');
+    for (const b of nodes) {
+      const txt = (b.textContent || '').trim();
+      if (txt && re.test(txt) && isVisible(b)) return b;
+    }
+    return null;
+  }
+
+  /** Strip truncation ellipses and stray toggle labels from a title string. */
+  function cleanTitle(t) {
+    return String(t || '')
+      .replace(/\s*(?:see\s*more|show\s*more|view\s*all|read\s*more)\s*$/i, '')
+      .replace(/(?:\.{3}|…)\s*$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  const cleanTag = t => String(t || '').replace(/\s+/g, ' ').trim();
+
+  /** Reject non-tag noise: toggle labels, pure numbers, over/under-length. */
+  function isJunkTag(t) {
+    if (!t) return true;
+    if (t.length < 2 || t.length > 60) return true;
+    if (/^(?:see\s*more|view\s*all|show\s*more|\+?\s*\d+\s*more)$/i.test(t)) return true;
+    if (/^\d+$/.test(t)) return true;
+    return false;
+  }
 
   // ──────────────────────────────────────────────────────────────
   // UTILITY: try each selector in array, return first match
@@ -234,46 +300,55 @@ function initContent() {
     const seenUrls = new Set();
     const max = timing.maxScrollAttempts;
     const pause = timing.scrollPauseMs;
+    let stagnantScrolls = 0; // consecutive scrolls that loaded no new cards
 
-    for (let attempt = 0; attempt < max; attempt++) {
-      const cardEls = allMatches(SEL.resultCard);
-      
-      // Extract unique cards from current DOM
-      for (const card of cardEls) {
+    const collectFromDom = () => {
+      for (const card of allMatches(SEL.resultCard)) {
         if (cards.length >= videoCount) break;
         const detailUrl = extractDetailUrl(card);
         const assetId = extractAssetId(detailUrl);
         if (detailUrl && assetId && !seenUrls.has(assetId)) {
           seenUrls.add(assetId);
-          const title = extractTitle(card);
-          cards.push({ title, detailUrl, assetId });
+          cards.push({ title: extractTitle(card), detailUrl, assetId });
         }
       }
+    };
+
+    for (let attempt = 0; attempt < max; attempt++) {
+      const before = cards.length;
+      collectFromDom();
 
       if (cards.length >= videoCount) {
-        console.log(`[content] Scrape done: ${cards.length}/${videoCount} unique cards`);
+        dbg(`scrapeVideoCards done: ${cards.length}/${videoCount} unique cards`);
         break;
       }
-      
-      console.log(`[content] Scroll ${attempt + 1}/${max}: ${cards.length}/${videoCount} unique cards`);
 
-      // Scroll results container (preferred) and window
+      // Detect an exhausted grid: several scrolls in a row with no growth.
+      if (cards.length === before) {
+        stagnantScrolls++;
+        if (stagnantScrolls >= 4) {
+          dbg(`scrapeVideoCards: grid exhausted at ${cards.length}/${videoCount} ` +
+              `(no new cards after ${stagnantScrolls} scrolls)`);
+          break;
+        }
+      } else {
+        stagnantScrolls = 0;
+      }
+
+      dbg(`scrapeVideoCards scroll ${attempt + 1}/${max}: ${cards.length}/${videoCount} unique`);
+
       const grid = firstMatch(SEL.resultsGrid);
       if (grid) grid.scrollBy({ top: grid.clientHeight * 2, behavior: 'smooth' });
       window.scrollBy({ top: window.innerHeight * 1.5, behavior: 'smooth' });
 
-      // Try "Load More" button
       const loadMoreBtn = findLoadMoreButton();
-      if (loadMoreBtn) {
-        console.log('[content] Clicking load-more button');
-        loadMoreBtn.click();
-      }
+      if (loadMoreBtn) { dbg('clicking load-more button'); loadMoreBtn.click(); }
 
       await new Promise(r => setTimeout(r, pause));
     }
 
-    console.log(`[content] Collected ${cards.length} unique cards`);
-    return { cards };
+    dbg(`scrapeVideoCards collected ${cards.length} unique cards`);
+    return { cards, exhausted: cards.length < videoCount };
   }
 
   function findLoadMoreButton() {
@@ -295,42 +370,29 @@ function initContent() {
    * Priority: data-title → img[alt] → a[title] → aria-label → text
    */
   function extractTitle(card) {
-    // data-title on any child
+    // Prefer clean attribute-based titles (these never contain "See More").
     const withData = card.querySelector('[data-title]');
-    if (withData) return withData.getAttribute('data-title').trim();
+    if (withData) return cleanTitle(withData.getAttribute('data-title'));
 
-    // img alt
     const img = card.querySelector('img[alt]');
     if (img) {
-      const alt = img.getAttribute('alt').trim();
+      const alt = cleanTitle(img.getAttribute('alt'));
       if (alt.length > 1) return alt;
     }
 
-    // a[title]
     const aTitle = card.querySelector('a[title]');
-    if (aTitle) return aTitle.getAttribute('title').trim();
+    if (aTitle) return cleanTitle(aTitle.getAttribute('title'));
 
-    // aria-label on any child
-    for (const sel of ['[aria-label]']) {
-      const el = card.querySelector(sel);
-      if (el && el.getAttribute('aria-label')) {
-        return el.getAttribute('aria-label').trim();
-      }
+    const ariaEl = card.querySelector('[aria-label]');
+    if (ariaEl && ariaEl.getAttribute('aria-label')) {
+      return cleanTitle(ariaEl.getAttribute('aria-label'));
     }
 
-    // class-based text element
-    for (const sel of ['[class*="title"]', '[class*="label"]', '[class*="name"]']) {
-      try {
-        const el = card.querySelector(sel);
-        if (el) {
-          const text = el.textContent.trim();
-          if (text.length > 1) return text;
-        }
-      } catch (_) {}
-    }
-
-    // Last resort: first non-empty text in card
-    return card.textContent.trim().split('\n')[0].trim() || 'Untitled';
+    // NOTE: this is only a grid fallback. The authoritative, fully-expanded
+    // title comes from the detail page (getDetailData). We deliberately avoid
+    // scraping truncated description blocks (which contain the "See More"
+    // button label) here.
+    return 'Untitled';
   }
 
   /**
@@ -352,12 +414,26 @@ function initContent() {
   }
 
   /**
-   * Extract the asset ID from a URL for true deduplication (ignores tracking params).
+   * Extract the stable numeric asset ID from a detail URL for reliable
+   * deduplication. Handles trailing slashes, query strings, and #fragments
+   * uniformly by taking the LAST purely-numeric path segment (Adobe Stock
+   * asset URLs are /<type>/<slug>/<id>). Falls back to an asset_id query
+   * param, then to the normalized origin+path, then the raw string.
    */
   function extractAssetId(url) {
     if (!url) return null;
-    const match = url.match(/\/(\d+)(?:\?|$)/);
-    return match ? match[1] : url; // fallback to full url if no numeric ID found
+    try {
+      const u = new URL(url, 'https://stock.adobe.com');
+      const segs = u.pathname.split('/').filter(Boolean);
+      for (let i = segs.length - 1; i >= 0; i--) {
+        if (/^\d+$/.test(segs[i])) return segs[i];
+      }
+      const qid = u.searchParams.get('asset_id') || u.searchParams.get('id');
+      if (qid && /^\d+$/.test(qid)) return qid;
+      return (u.origin + u.pathname).replace(/\/+$/, '');
+    } catch (_) {
+      return url;
+    }
   }
 
   // ──────────────────────────────────────────────────────────────
@@ -366,130 +442,168 @@ function initContent() {
   // Called when content.js is injected into a hidden detail tab.
   // Uses multiple strategies in decreasing order of reliability.
   // ──────────────────────────────────────────────────────────────
-  async function getDetailTags() {
+  async function getDetailData() {
     const { timing } = SEL;
-    const tags = new Set();
-    let fullTitle = '';
-    let targetTagCount = null;
+    const assetId = extractAssetId(location.href);
+    dbg('getDetailData ▶ id=' + assetId, location.href);
 
-    // Expand title if truncated
+    // ── 1. Wait for the page's core content (title OR tag list) ──────
+    // Detail pages are React SPAs; the tag list renders after hydration.
     try {
-      const titleEl = firstMatch(SEL.detailTitle);
-      const titleExpandBtn = firstMatch(SEL.detailTitleExpandBtn);
-      
-      if (titleEl && titleExpandBtn) {
-        const initialLength = titleEl.textContent.length;
-        console.log('[content] Clicking "See More" title button...');
-        titleExpandBtn.click();
-        
-        // Wait for text to expand or button to disappear
-        for (let i = 0; i < 15; i++) {
-          await new Promise(r => setTimeout(r, 100));
-          if (titleEl.textContent.length > initialLength || !titleExpandBtn.offsetParent) {
-            break;
-          }
-        }
-        if (titleEl.textContent.length === initialLength && titleExpandBtn.offsetParent) {
-          console.warn('[content] "See More" title button clicked but text length did not increase.');
-        }
-      }
-    } catch (_) {}
-
-    // Extract full title without button text
-    try {
-      const titleEl = firstMatch(SEL.detailTitle);
-      if (titleEl) {
-        // Clone node to remove buttons without affecting the DOM
-        const clone = titleEl.cloneNode(true);
-        const buttons = clone.querySelectorAll('button, a[role="button"]');
-        buttons.forEach(btn => btn.remove());
-        
-        fullTitle = clone.innerText.trim(); // use innerText for better formatting
-        if (!fullTitle) fullTitle = clone.textContent.trim();
-      }
-    } catch (_) {}
-
-    // Parse target tag count if indicator is present
-    try {
-      const countEl = firstMatch(SEL.detailTagsCountIndicator);
-      if (countEl) {
-        const match = countEl.textContent.match(/(\d+)/);
-        if (match) targetTagCount = parseInt(match[1], 10);
-      }
-    } catch (_) {}
-
-    // Expand tags list
-    try {
-      const expandBtn = firstMatch(SEL.detailTagsExpandBtn) || firstMatch(SEL.detailTagsViewAllBtn);
-      if (expandBtn) {
-        console.log('[content] Clicking expand tags button...');
-        expandBtn.click();
-        
-        // Wait for button to disappear or new tags to appear
-        for (let i = 0; i < 15; i++) {
-          await new Promise(r => setTimeout(r, 100));
-          if (!expandBtn.offsetParent) break;
-        }
-      }
-    } catch (_) {}
-
-    // Strategy 1: Wait for the tags container, then collect links
-    try {
-      const container = await waitForElement(SEL.detailTagsContainer, timing.gridLoadTimeout);
-      if (container) {
-        const tagEls = allMatches(SEL.detailTagItem, container);
-        tagEls.forEach(el => {
-          const t = el.textContent.trim();
-          if (t.length > 1 && t.length < 80) tags.add(t);
-        });
-      }
+      await waitForElement(
+        [...SEL.detailTitle, ...SEL.detailTagsContainer, 'a[href*="?k="]'],
+        timing.detailLoadTimeout
+      );
     } catch (_) {
-      // Container not found — continue to fallback strategies
+      dbg('  core content wait timed out — proceeding with whatever is present');
     }
 
-    // Strategy 2: All search-link <a> tags on the page (keyword links)
-    if (tags.size === 0) {
-      document.querySelectorAll('a[href*="?k="]').forEach(a => {
-        const t = a.textContent.trim();
-        if (t.length > 1 && t.length < 80) tags.add(t);
-      });
-    }
+    // ── 2. Expand the truncated title ("See More") and VERIFY ────────
+    const titleExpanded = await expandTitle();
+    dbg('  title expand:', titleExpanded);
 
-    // Strategy 3: Meta keywords tag
-    if (tags.size === 0) {
-      const meta = document.querySelector('meta[name="keywords"]');
-      if (meta?.content) {
-        meta.content.split(',').forEach(k => {
-          const t = k.trim();
-          if (t) tags.add(t);
-        });
-      }
-    }
+    // ── 3. Read the expected tag count, expand the list, VERIFY ──────
+    const targetTagCount = readTargetTagCount();
+    const tagExpansion = await expandTags(targetTagCount);
+    dbg('  tag expand:', tagExpansion);
 
-    // Strategy 4: JSON-LD structured data
-    if (tags.size === 0) {
-      document.querySelectorAll('script[type="application/ld+json"]').forEach(script => {
-        try {
-          extractJsonLdTagsLocal(JSON.parse(script.textContent), tags);
-        } catch (_) {}
-      });
-    }
+    // ── 4. Extract the clean title (button/toggle text stripped) ─────
+    const title = extractDetailTitle();
 
-    console.log(`[content] Detail page tags (${tags.size}):`, [...tags].slice(0, 5), 'title:', fullTitle);
-    return { tags: [...tags], title: fullTitle, targetTagCount };
+    // ── 5. Extract the fully-expanded tag list ───────────────────────
+    const tags = collectTags();
+
+    dbg(`getDetailData ◀ id=${assetId} title="${title}" tags=${tags.length}` +
+        (targetTagCount ? `/${targetTagCount}` : ''));
+    return { assetId, title, tags, targetTagCount };
   }
 
-  function extractJsonLdTagsLocal(data, tagSet) {
+  /** Click the title "See More" toggle and confirm the text actually grew. */
+  async function expandTitle() {
+    const titleEl = firstMatch(SEL.detailTitle);
+    if (!titleEl) return false;
+    let btn = firstMatch(SEL.detailTitleExpandBtn) || findButtonByText(/see\s*more|show\s*more/i, titleEl.parentElement || document);
+    if (!btn || !isVisible(btn)) return false;
+
+    const before = titleEl.textContent.trim().length;
+    dbg('  clicking See More (title), len before =', before);
+    try { btn.click(); } catch (_) { return false; }
+
+    // Success = title grew OR the toggle button disappeared.
+    const ok = await waitFor(
+      () => titleEl.textContent.trim().length > before || !isVisible(btn),
+      SEL.timing.expandVerifyTimeout
+    );
+    if (!ok) dbg('  ⚠ See More clicked but no verified change');
+    return ok;
+  }
+
+  /** Parse the "N keywords" indicator, if present. */
+  function readTargetTagCount() {
+    const countEl = firstMatch(SEL.detailTagsCountIndicator);
+    if (countEl) {
+      const m = countEl.textContent.match(/(\d+)/);
+      if (m) return parseInt(m[1], 10);
+    }
+    return null;
+  }
+
+  /**
+   * Click the "View All" / expand-keywords toggle, verify more tags
+   * appeared, then wait for the count to stabilize so we never read a
+   * half-rendered list.
+   */
+  async function expandTags(targetTagCount) {
+    const before = getTagElements().length;
+    let btn = firstMatch(SEL.detailTagsViewAllBtn) ||
+              firstMatch(SEL.detailTagsExpandBtn) ||
+              findButtonByText(/view\s*all|show\s*(all|more)|see\s*all|\+\s*\d+\s*more/i);
+
+    if (btn && isVisible(btn)) {
+      dbg('  clicking View All (tags), tags before =', before, 'target =', targetTagCount ?? '?');
+      try { btn.click(); } catch (_) {}
+      await waitFor(() => {
+        const n = getTagElements().length;
+        if (targetTagCount) return n >= targetTagCount;
+        return n > before || !isVisible(btn);
+      }, SEL.timing.expandVerifyTimeout);
+    } else {
+      dbg('  no tag-expand toggle found (list may already be full)');
+    }
+
+    // Let lazily-rendered tags settle.
+    const finalCount = await waitUntilStable(() => getTagElements().length, 2000);
+    return { before, after: finalCount, clicked: !!(btn && isVisible(btn)) };
+  }
+
+  /**
+   * The current set of tag elements. Prefer the dedicated keyword
+   * container; fall back to all keyword-search links on the page.
+   */
+  function getTagElements() {
+    const container = firstMatch(SEL.detailTagsContainer);
+    if (container) {
+      const els = allMatches(SEL.detailTagItem, container);
+      if (els.length) return els;
+    }
+    return [...document.querySelectorAll('a[href*="?k="]')];
+  }
+
+  /** Extract the clean detail-page title, excluding any toggle button text. */
+  function extractDetailTitle() {
+    const el = firstMatch(SEL.detailTitle);
+    if (!el) return '';
+    const clone = el.cloneNode(true);
+    // Remove the "See More" toggle (and any other buttons) so its label
+    // can never leak into the title text.
+    clone.querySelectorAll(
+      'button, a[role="button"], [role="button"], [class*="see-more" i], [class*="seemore" i], [class*="show-more" i]'
+    ).forEach(n => n.remove());
+    const raw = (clone.innerText || clone.textContent || '').trim();
+    return cleanTitle(raw);
+  }
+
+  /** Collect, clean, and de-duplicate tags from the (expanded) DOM. */
+  function collectTags() {
+    const seen = new Set();
+    const out = [];
+
+    const push = t => {
+      const c = cleanTag(t);
+      if (isJunkTag(c)) return;
+      const key = c.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(c);
+    };
+
+    // Primary: rendered keyword links (authoritative once expanded).
+    getTagElements().forEach(el => push(el.textContent));
+
+    // Fallbacks only if the DOM yielded nothing (e.g. render blocked).
+    if (out.length === 0) {
+      const meta = document.querySelector('meta[name="keywords"]');
+      if (meta?.content) meta.content.split(',').forEach(push);
+    }
+    if (out.length === 0) {
+      document.querySelectorAll('script[type="application/ld+json"]').forEach(script => {
+        try { extractJsonLdTagsLocal(JSON.parse(script.textContent), push); } catch (_) {}
+      });
+    }
+    return out;
+  }
+
+  function extractJsonLdTagsLocal(data, push) {
     if (!data) return;
     if (data.keywords) {
       const kws = Array.isArray(data.keywords) ? data.keywords : String(data.keywords).split(',');
-      kws.forEach(k => { const t = k.trim(); if (t) tagSet.add(t); });
+      kws.forEach(push);
     }
     if (data.about) {
       (Array.isArray(data.about) ? data.about : [data.about])
-        .forEach(item => { if (item?.name) tagSet.add(item.name.trim()); });
+        .forEach(item => { if (item?.name) push(item.name); });
     }
-    if (data['@graph']) data['@graph'].forEach(n => extractJsonLdTagsLocal(n, tagSet));
+    if (data['@graph']) data['@graph'].forEach(n => extractJsonLdTagsLocal(n, push));
   }
 
   // ──────────────────────────────────────────────────────────────
@@ -515,8 +629,9 @@ function initContent() {
         scrapeVideoCards(msg.videoCount || 20).then(sendResponse).catch(e => sendResponse({ error: e.message }));
         return true;
 
-      case 'get_detail_tags':
-        getDetailTags().then(sendResponse).catch(e => sendResponse({ error: e.message }));
+      case 'get_detail_data':
+      case 'get_detail_tags': // backward-compatible alias
+        getDetailData().then(sendResponse).catch(e => sendResponse({ error: e.message }));
         return true;
 
       case 'ping':

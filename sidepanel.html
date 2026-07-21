@@ -129,6 +129,17 @@
       <div class="progress-bar" id="progressBar"></div>
     </div>
 
+    <!-- Video Progress header -->
+    <div class="progress-header" style="margin-top: 10px; margin-bottom: 4px; display: none;" id="videoProgressHeader">
+      <span style="font-size:11px; color:var(--text-muted);" id="videoProgressLabel">0 / 0 videos</span>
+      <span style="font-size:11px; font-weight:700; color:var(--accent);" id="videoProgressPct">0%</span>
+    </div>
+
+    <!-- Video Progress bar -->
+    <div class="progress-bar-wrap" style="display: none;" id="videoProgressWrap">
+      <div class="progress-bar video-progress-bar" id="videoProgressBar"></div>
+    </div>
+
     <!-- Current step -->
     <div class="current-step" id="currentStep">
       <span style="color:var(--text-dim);">Ready — configure settings and press Start.</span>
@@ -177,7 +188,7 @@
 <!-- ══ FOOTER ═══════════════════════════════════════════════════ -->
 <footer class="footer">
   <span id="footerStatus" style="font-size:11px; color:var(--text-muted);">Adobe Stock Keyword Research Tool</span>
-  <span class="footer-version">v2.0.0</span>
+  <span class="footer-version">v2.1.0</span>
 </footer>
 
 <!-- SheetJS loaded here (side panel DOM context) so XLSX global is available.

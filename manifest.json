@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Adobe Stock Keyword Research Tool",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Automates keyword competition research and video data scraping on Adobe Stock — with Side Panel UI, pause/resume, and Excel export.",
 
   "icons": {
