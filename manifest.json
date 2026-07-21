@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "Adobe Stock Keyword Research Tool",
+  "version": "2.0.0",
+  "description": "Automates keyword competition research and video data scraping on Adobe Stock — with Side Panel UI, pause/resume, and Excel export.",
+
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "action": {
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "Adobe Stock Keyword Research Tool"
+  },
+
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://stock.adobe.com/*"],
+      "js": ["config/selectors.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "tabs",
+    "sidePanel",
+    "downloads"
+  ],
+
+  "host_permissions": [
+    "https://stock.adobe.com/*"
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "lib/xlsx.min.js",
+        "utils/excelExport.js",
+        "utils/stateManager.js",
+        "config/selectors.js"
+      ],
+      "matches": ["https://stock.adobe.com/*"]
+    }
+  ]
+}

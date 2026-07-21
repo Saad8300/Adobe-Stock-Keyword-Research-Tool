@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Adobe Stock Keyword Research</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+
+<!-- ══ HEADER ═══════════════════════════════════════════════════ -->
+<header class="header">
+  <div class="header-logo">AS</div>
+  <div class="header-text">
+    <div class="header-title">Adobe Stock Research</div>
+    <div class="header-sub">Keyword Competition &amp; Video Scraper</div>
+  </div>
+  <div class="header-badge">
+    <div class="status-chip chip-idle" id="statusChip">
+      <span>Idle</span>
+    </div>
+  </div>
+</header>
+
+<!-- ══ MAIN SCROLL AREA ════════════════════════════════════════ -->
+<main class="main" id="mainArea">
+
+  <!-- ── Resume Banner (hidden by default) ───────────────────── -->
+  <div class="section" id="resumeBannerSection" style="display:none; padding-bottom:10px;">
+    <div class="resume-banner" id="resumeBanner">
+      <span class="resume-banner-icon">⏸</span>
+      <div class="resume-banner-text">
+        <strong id="resumeBannerTitle">Previous session found</strong>
+        <small id="resumeBannerSub">Loading…</small>
+      </div>
+      <button class="btn btn-resume" id="btnResumeBanner" style="white-space:nowrap; flex-shrink:0;">
+        ▶ Resume
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Settings Section ────────────────────────────────────── -->
+  <section class="section" id="settingsSection">
+    <div class="section-title">
+      <span class="section-title-icon">⚙</span> Settings
+    </div>
+
+    <!-- Mode tabs -->
+    <div class="tab-toggle">
+      <button class="tab-btn active" id="tabSingle" type="button">Single Keyword</button>
+      <button class="tab-btn"        id="tabBulk"   type="button">Bulk Keywords</button>
+    </div>
+
+    <!-- Single keyword -->
+    <div class="panel active" id="panelSingle">
+      <div class="field">
+        <label class="field-label" for="inputSingle">Keyword</label>
+        <input
+          class="field-input" id="inputSingle" type="text"
+          placeholder="e.g. aerial drone city sunset"
+          autocomplete="off" spellcheck="false"
+        />
+      </div>
+    </div>
+
+    <!-- Bulk keywords -->
+    <div class="panel" id="panelBulk">
+      <div class="field">
+        <label class="field-label" for="inputBulk">Keywords — one per line</label>
+        <textarea
+          class="field-input" id="inputBulk"
+          placeholder="aerial drone city sunset&#10;ocean waves slow motion&#10;business team meeting"
+          spellcheck="false"
+        ></textarea>
+      </div>
+    </div>
+
+    <!-- Competition range + video count -->
+    <div class="field-row">
+      <div class="field">
+        <label class="field-label" for="inputMinComp">Min Competition</label>
+        <input class="field-input" id="inputMinComp" type="number" placeholder="10000" min="0" />
+      </div>
+      <div class="field">
+        <label class="field-label" for="inputMaxComp">Max Competition</label>
+        <input class="field-input" id="inputMaxComp" type="number" placeholder="15000" min="0" />
+      </div>
+      <div class="field" style="max-width:80px;">
+        <label class="field-label" for="inputVideoCount">Videos</label>
+        <input class="field-input" id="inputVideoCount" type="number" placeholder="20" min="1" max="200" />
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Controls Section ────────────────────────────────────── -->
+  <section class="section">
+    <div class="btn-group" id="btnGroup">
+      <button class="btn btn-start"   id="btnStart"  type="button"><span>▶</span> Start</button>
+      <button class="btn btn-stop"    id="btnStop"   type="button" disabled><span>◼</span> Stop</button>
+      <button class="btn btn-pause"   id="btnPause"  type="button" disabled><span>⏸</span> Pause</button>
+      <button class="btn btn-resume"  id="btnResume" type="button" disabled><span>▶▶</span> Resume</button>
+    </div>
+    <!-- Export button -->
+    <div style="margin-top:6px;">
+      <button class="btn btn-export" id="btnExport" type="button" disabled style="width:100%;">
+        <span>⬇</span> Download Excel Report
+      </button>
+    </div>
+  </section>
+
+  <!-- ── Progress Section ─────────────────────────────────────── -->
+  <section class="section" id="progressSection">
+    <div class="section-title">
+      <span class="section-title-icon">📊</span> Progress
+    </div>
+
+    <!-- Stats row -->
+    <div class="progress-header">
+      <span style="font-size:11px; color:var(--text-muted);" id="progressLabel">0 / 0 keywords</span>
+      <div class="progress-meta">
+        <span class="progress-stat"><span class="dot dot-green"></span><span id="cntQualified">0</span></span>
+        <span class="progress-stat"><span class="dot dot-yellow"></span><span id="cntSkipped">0</span></span>
+        <span class="progress-stat"><span class="dot dot-red"></span><span id="cntErrors">0</span></span>
+      </div>
+    </div>
+
+    <!-- Progress bar -->
+    <div class="progress-bar-wrap">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+
+    <!-- Current step -->
+    <div class="current-step" id="currentStep">
+      <span style="color:var(--text-dim);">Ready — configure settings and press Start.</span>
+    </div>
+
+    <!-- Activity log -->
+    <div class="log-box" id="logBox">
+      <div class="log-inner" id="logInner">
+        <div class="log-line">
+          <span class="log-time">--:--:--</span>
+          <span class="log-msg log-muted">Ready — no active session.</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Results Table Section ────────────────────────────────── -->
+  <section class="section" id="resultsSection">
+    <div class="section-title">
+      <span class="section-title-icon">📋</span>
+      Results
+      <span id="resultCount" style="margin-left:auto; font-size:10px; font-weight:400; color:var(--text-dim);">0 processed</span>
+    </div>
+
+    <div class="results-table-wrap" id="resultsTableWrap">
+      <div class="empty-state" id="resultsEmpty">
+        <span class="empty-state-icon">🔍</span>
+        Results will appear here as keywords are processed.
+      </div>
+      <table class="results-table" id="resultsTable" style="display:none;">
+        <thead>
+          <tr>
+            <th>Keyword</th>
+            <th>Status</th>
+            <th>Competition</th>
+            <th>Videos</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<!-- ══ FOOTER ═══════════════════════════════════════════════════ -->
+<footer class="footer">
+  <span id="footerStatus" style="font-size:11px; color:var(--text-muted);">Adobe Stock Keyword Research Tool</span>
+  <span class="footer-version">v2.0.0</span>
+</footer>
+
+<!-- SheetJS loaded here (side panel DOM context) so XLSX global is available.
+     Do NOT load xlsx.min.js in background.js — service workers have no window/DOM. -->
+<script src="lib/xlsx.min.js"></script>
+<script src="sidepanel.js"></script>
+</body>
+</html>
