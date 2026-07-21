@@ -242,10 +242,11 @@ function initContent() {
       for (const card of cardEls) {
         if (cards.length >= videoCount) break;
         const detailUrl = extractDetailUrl(card);
-        if (detailUrl && !seenUrls.has(detailUrl)) {
-          seenUrls.add(detailUrl);
+        const assetId = extractAssetId(detailUrl);
+        if (detailUrl && assetId && !seenUrls.has(assetId)) {
+          seenUrls.add(assetId);
           const title = extractTitle(card);
-          cards.push({ title, detailUrl });
+          cards.push({ title, detailUrl, assetId });
         }
       }
 
@@ -350,6 +351,15 @@ function initContent() {
     return null;
   }
 
+  /**
+   * Extract the asset ID from a URL for true deduplication (ignores tracking params).
+   */
+  function extractAssetId(url) {
+    if (!url) return null;
+    const match = url.match(/\/(\d+)(?:\?|$)/);
+    return match ? match[1] : url; // fallback to full url if no numeric ID found
+  }
+
   // ──────────────────────────────────────────────────────────────
   // ACTION: get_detail_tags
   // Scrape the tag/keyword list from an asset detail page.
@@ -360,25 +370,65 @@ function initContent() {
     const { timing } = SEL;
     const tags = new Set();
     let fullTitle = '';
+    let targetTagCount = null;
 
-    // BUG 4 FIX: Extract full title from detail page
+    // Expand title if truncated
     try {
       const titleEl = firstMatch(SEL.detailTitle);
-      if (titleEl) {
-        fullTitle = titleEl.textContent.trim();
+      const titleExpandBtn = firstMatch(SEL.detailTitleExpandBtn);
+      
+      if (titleEl && titleExpandBtn) {
+        const initialLength = titleEl.textContent.length;
+        console.log('[content] Clicking "See More" title button...');
+        titleExpandBtn.click();
+        
+        // Wait for text to expand or button to disappear
+        for (let i = 0; i < 15; i++) {
+          await new Promise(r => setTimeout(r, 100));
+          if (titleEl.textContent.length > initialLength || !titleExpandBtn.offsetParent) {
+            break;
+          }
+        }
+        if (titleEl.textContent.length === initialLength && titleExpandBtn.offsetParent) {
+          console.warn('[content] "See More" title button clicked but text length did not increase.');
+        }
       }
     } catch (_) {}
 
-    // BUG 3 FIX: Click "Show more tags" to expand the list before scraping
+    // Extract full title without button text
     try {
-      const expandBtn = firstMatch(SEL.detailTagsExpandBtn);
+      const titleEl = firstMatch(SEL.detailTitle);
+      if (titleEl) {
+        // Clone node to remove buttons without affecting the DOM
+        const clone = titleEl.cloneNode(true);
+        const buttons = clone.querySelectorAll('button, a[role="button"]');
+        buttons.forEach(btn => btn.remove());
+        
+        fullTitle = clone.innerText.trim(); // use innerText for better formatting
+        if (!fullTitle) fullTitle = clone.textContent.trim();
+      }
+    } catch (_) {}
+
+    // Parse target tag count if indicator is present
+    try {
+      const countEl = firstMatch(SEL.detailTagsCountIndicator);
+      if (countEl) {
+        const match = countEl.textContent.match(/(\d+)/);
+        if (match) targetTagCount = parseInt(match[1], 10);
+      }
+    } catch (_) {}
+
+    // Expand tags list
+    try {
+      const expandBtn = firstMatch(SEL.detailTagsExpandBtn) || firstMatch(SEL.detailTagsViewAllBtn);
       if (expandBtn) {
-        console.log('[content] Clicking "Show more tags" button...');
+        console.log('[content] Clicking expand tags button...');
         expandBtn.click();
         
-        // Wait briefly for the DOM to update with new tags
-        for (let i = 0; i < 3; i++) {
-          await new Promise(r => setTimeout(r, 600));
+        // Wait for button to disappear or new tags to appear
+        for (let i = 0; i < 15; i++) {
+          await new Promise(r => setTimeout(r, 100));
+          if (!expandBtn.offsetParent) break;
         }
       }
     } catch (_) {}
@@ -426,7 +476,7 @@ function initContent() {
     }
 
     console.log(`[content] Detail page tags (${tags.size}):`, [...tags].slice(0, 5), 'title:', fullTitle);
-    return { tags: [...tags], title: fullTitle };
+    return { tags: [...tags], title: fullTitle, targetTagCount };
   }
 
   function extractJsonLdTagsLocal(data, tagSet) {

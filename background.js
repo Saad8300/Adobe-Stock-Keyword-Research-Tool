@@ -89,7 +89,16 @@ function notify(event, data = {}) {
 }
 
 /** Random delay between minMs and maxMs milliseconds. */
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Extract the asset ID from a URL for true deduplication (ignores tracking params).
+ */
+function extractAssetId(url) {
+  if (!url) return null;
+  const match = url.match(/\/(\d+)(?:\?|$)/);
+  return match ? match[1] : url; // fallback to full url if no numeric ID found
+}
 const randomDelay = (min, max) => sleep(Math.floor(Math.random() * (max - min + 1)) + min);
 
 /**
@@ -228,7 +237,7 @@ async function fetchTagsFromDetailPage(url) {
 
       if (tags.length > 0) {
         console.log(`[bg] fetch() got ${tags.length} tags from ${url}`);
-        return { tags, title };
+        return { tags, title, targetTagCount: null };
       }
       // Zero tags from static parse — fall through to tab method
     }
@@ -297,7 +306,8 @@ async function fetchTagsViaHiddenTab(url) {
     const resp = await sendToContent(tabId, { action: 'get_detail_tags' }, 3);
     return {
       tags: (resp && Array.isArray(resp.tags)) ? resp.tags : [],
-      title: resp?.title || ''
+      title: resp?.title || '',
+      targetTagCount: resp?.targetTagCount || null
     };
   } catch (e) {
     console.warn('[bg] Hidden tab tag fetch failed:', e.message);
@@ -406,64 +416,113 @@ async function processKeyword(keyword, index, total) {
 
     if (keywordTimedOut) throw new Error('Keyword timed out before scraping');
 
-    // ── STEP 6: Scrape top N video cards from the grid ───────────
-    notify('step', { keyword, step: `Scraping top ${videoCount} videos…` });
-    const cardsResp = await sendToContent(rt.workingTabId, {
-      action: 'scrape_video_cards',
-      videoCount
-    });
-
-    if (!cardsResp || cardsResp.error) {
-      throw new Error(cardsResp?.error || 'No response from content script (scrape_video_cards)');
-    }
-
-    const cards = cardsResp.cards || [];
-    notify('log', { message: `  Found ${cards.length} video card(s) to process`, type: 'muted' });
-
-    // ── STEP 7: Fetch tags from each video detail page ────────────
+    // ── STEP 6 & 7: Scrape videos and fetch tags ───────────
     const videos = [];
-    for (let i = 0; i < cards.length; i++) {
-      if (rt.stopFlag || rt.pauseFlag) break;
-      if (keywordTimedOut) break;
+    let failedCount = 0;
+    const processedUrls = new Set();
+    let exhaustedGrid = false;
+    let totalCardsFound = 0;
 
-      const card = cards[i];
-      notify('scrape_progress', {
-        keyword,
-        scraped: i,
-        total: cards.length,
-        step: `Fetching tags for video ${i + 1}/${cards.length}…`
+    while (videos.length < videoCount) {
+      if (rt.stopFlag || rt.pauseFlag || keywordTimedOut) break;
+
+      const target = videoCount + failedCount;
+      notify('step', { keyword, step: `Scraping up to ${target} videos…` });
+      notify('log', { message: `[DEBUG] Iteration start: videos=${videos.length}, failed=${failedCount}, requesting=${target} unique cards.` });
+      
+      const cardsResp = await sendToContent(rt.workingTabId, {
+        action: 'scrape_video_cards',
+        videoCount: target
       });
 
-      let tags = [];
-      let fullTitle = card.title || `Video ${i + 1}`;
-      if (card.detailUrl) {
-        try {
-          const detailData = await fetchTagsFromDetailPage(card.detailUrl);
-          tags = detailData.tags;
-          if (detailData.title) fullTitle = detailData.title;
-        } catch (e) {
-          notify('log', {
-            message: `  ⚠ Tag fetch failed for "${card.title || 'video ' + (i+1)}": ${e.message}`,
-            type: 'skip'
-          });
-        }
-        // Randomized delay between detail page fetches
-        await randomDelay(800, 2000);
+      if (!cardsResp || cardsResp.error) {
+        throw new Error(cardsResp?.error || 'No response from content script (scrape_video_cards)');
       }
 
-      videos.push({ title: fullTitle, tags });
+      const cards = cardsResp.cards || [];
+      totalCardsFound = cards.length;
+      
+      const newCards = cards.filter(c => {
+        const id = extractAssetId(c.detailUrl);
+        return !processedUrls.has(id);
+      });
+      
+      notify('log', { message: `[DEBUG] Found ${cards.length} cards, ${newCards.length} are genuinely new.` });
+
+      if (newCards.length === 0) {
+        // No new unique cards found on this scroll attempt.
+        notify('log', { message: `[DEBUG] Exhausted grid. No new unique cards returned.` });
+        exhaustedGrid = true;
+        break;
+      }
+
+      for (const card of newCards) {
+        if (videos.length >= videoCount) break;
+        if (rt.stopFlag || rt.pauseFlag || keywordTimedOut) break;
+
+        const assetId = extractAssetId(card.detailUrl);
+        processedUrls.add(assetId);
+        const currentNum = videos.length + 1;
+        notify('log', { message: `[DEBUG] Processing video ID ${assetId} (${currentNum}/${videoCount})` });
+        
+        notify('scrape_progress', {
+          keyword,
+          scraped: videos.length,
+          total: videoCount,
+          step: `Fetching tags for video ${currentNum}/${videoCount}…`
+        });
+
+        let tags = [];
+        let fullTitle = card.title || `Video ${currentNum}`;
+        let success = false;
+        
+        if (card.detailUrl) {
+          try {
+            // Promise.race to ensure we don't hang indefinitely on one detail page
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Detail page fetch timeout (25s)')), 25000));
+            const detailData = await Promise.race([
+              fetchTagsFromDetailPage(card.detailUrl),
+              timeoutPromise
+            ]);
+            
+            tags = detailData.tags;
+            if (detailData.title) fullTitle = detailData.title;
+            
+            if (detailData.targetTagCount && tags.length < detailData.targetTagCount) {
+              notify('log', {
+                message: `  ⚠ Partial tags: ${tags.length}/${detailData.targetTagCount} captured for "${fullTitle}"`,
+                type: 'skip'
+              });
+            }
+            success = true;
+          } catch (e) {
+            notify('log', {
+              message: `  ⚠ Tag fetch failed for "${fullTitle}": ${e.message}`,
+              type: 'skip'
+            });
+            failedCount++;
+          }
+          await randomDelay(800, 2000);
+        } else {
+          failedCount++;
+        }
+
+        if (success) {
+          videos.push({ title: fullTitle, tags });
+        }
+      }
     }
 
-    notify('scrape_progress', { keyword, scraped: videos.length, total: cards.length, step: 'Done' });
+    notify('scrape_progress', { keyword, scraped: videos.length, total: videoCount, step: 'Done' });
     
     // ── VALIDATION CHECK ──────────────────────────────────────────
     if (videos.length < videoCount) {
+      const reason = exhaustedGrid ? "no more results after max scroll" : (keywordTimedOut ? "keyword timed out" : "stopped/paused");
       notify('log', {
-        message: `  ⚠ Validation: only ${videos.length}/${videoCount} unique videos found (grid may have fewer results or max scroll reached)`,
+        message: `  ⚠ Validation: only ${videos.length}/${videoCount} unique videos found (${reason})`,
         type: 'error'
       });
-      // Ensure we record the reason in the summary
-      result.skipReason = (result.skipReason ? result.skipReason + '; ' : '') + `Partial scrape: ${videos.length}/${videoCount} videos`;
+      result.skipReason = (result.skipReason ? result.skipReason + '; ' : '') + `Partial scrape: ${videos.length}/${videoCount} videos (${reason})`;
     } else {
       notify('log', {
         message: `  ✓ Validation: successfully scraped ${videos.length} unique videos`,
