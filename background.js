@@ -186,8 +186,10 @@ async function navigateWorkingTab(url) {
     }
   }
   await waitForTabLoad(rt.workingTabId, 35000);
-  // Extra pause for React/SPA frameworks to finish rendering
-  await sleep(1500);
+  // Small settle only. The steps that read dynamic content afterwards
+  // (get_result_count, scrape_video_cards) do their OWN condition-based
+  // waits in content.js, so we don't gate on a fixed render timer here.
+  await sleep(500);
 }
 
 /** Close the working tab when the run finishes or is stopped. */
@@ -236,14 +238,22 @@ async function closeDetailTab() {
 /**
  * Navigate the reused detail tab to an asset URL and extract its
  * title + full tag list from the rendered DOM.
+ *
+ * We do NOT trust tab "load complete" as a signal that the (lazily
+ * rendered) keyword list is present — that race caused inconsistent
+ * partial-tag results. content.js::getDetailData does the real
+ * condition-based wait (waitForTagsReady) plus a retry loop, and returns
+ * per-video diagnostics (complete / attempts / readyMs / elapsedMs).
+ *
  * @param {string} url — full asset detail URL
- * @returns {Promise<{assetId:string, title:string, tags:string[], targetTagCount:number|null}>}
  */
 async function scrapeDetailPage(url) {
   await ensureDetailTab();
   await chrome.tabs.update(rt.detailTabId, { url });
   await waitForTabLoad(rt.detailTabId, 30000);
-  await sleep(1000); // brief settle before content.js begins its own waits
+  // Minimal settle only so the content script is injectable; the actual
+  // "is the tags section rendered?" wait happens inside content.js.
+  await sleep(300);
 
   const resp = await sendToContent(rt.detailTabId, { action: 'get_detail_data' }, 3);
   if (resp?.error) throw new Error(resp.error);
@@ -252,7 +262,11 @@ async function scrapeDetailPage(url) {
     assetId:        resp?.assetId || extractAssetId(url),
     title:          resp?.title || '',
     tags:           Array.isArray(resp?.tags) ? resp.tags : [],
-    targetTagCount: resp?.targetTagCount ?? null
+    targetTagCount: resp?.targetTagCount ?? null,
+    complete:       resp?.complete ?? null,
+    attempts:       resp?.attempts ?? null,
+    readyMs:        resp?.readyMs ?? null,
+    elapsedMs:      resp?.elapsedMs ?? null
   };
 }
 
@@ -310,7 +324,7 @@ async function processKeyword(keyword, index, total) {
     const verifyResp = await sendToContent(rt.workingTabId, { action: 'verify_and_fix_filters' });
     if (verifyResp?.navigatedTo) {
       await waitForTabLoad(rt.workingTabId, 25000);
-      await sleep(1500);
+      await sleep(500); // content-side reads re-wait condition-based
     }
     if (Date.now() > setupDeadline) throw new Error('Timed out during filter verification');
 
@@ -376,8 +390,20 @@ async function processKeyword(keyword, index, total) {
           scrapeDetailPage(url),
           new Promise((_, rej) => setTimeout(() => rej(new Error('detail page timeout (30s)')), 30000))
         ]);
-        dbg(`  ◀ id=${detail.assetId} title="${detail.title}" tags=${detail.tags.length}` +
-            (detail.targetTagCount ? `/${detail.targetTagCount}` : ''));
+        // Per-video timing/retry diagnostics — makes intermittent timing
+        // variance visible in the console instead of invisible.
+        dbg(`  ◀ id=${detail.assetId} tags=${detail.tags.length}` +
+            (detail.targetTagCount ? `/${detail.targetTagCount}` : '') +
+            ` complete=${detail.complete} attempts=${detail.attempts}` +
+            ` readyMs=${detail.readyMs} totalMs=${detail.elapsedMs} title="${detail.title}"`);
+        if (detail.complete === false) {
+          notify('log', {
+            message: `  ⚠ Tags may be incomplete for "${detail.title}" ` +
+              `(${detail.tags.length}${detail.targetTagCount ? '/' + detail.targetTagCount : ''}` +
+              `, after ${detail.attempts} attempts / ${detail.elapsedMs}ms)`,
+            type: 'skip'
+          });
+        }
         return detail;
       },
 

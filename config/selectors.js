@@ -358,11 +358,27 @@ window.ADOBE_STOCK_SELECTORS = {
     /** Max ms to wait for at least one card to appear in the grid */
     gridLoadTimeout: 25000,
 
-    /** Max ms to wait for the keyword/tag list to render on a detail page */
-    detailLoadTimeout: 12000,
+    /** Max ms to wait for the keyword/tag list to render on a detail page.
+     *  Generous on purpose: slow server responses render the lazy tags
+     *  section late, and reading too early is the root cause of the
+     *  "some videos get partial tags" intermittent bug. */
+    detailLoadTimeout: 15000,
 
     /** Max ms to wait for an expand toggle (See More / View All) to take effect */
-    expandVerifyTimeout: 3500,
+    expandVerifyTimeout: 4000,
+
+    /** Max ms to wait for the tag count to stop changing (DOM-settled check) */
+    tagStableTimeout: 3500,
+
+    /** How many times to re-expand + re-read a detail page's tags before
+     *  accepting a possibly-incomplete result (with backoff between tries) */
+    tagRetryMax: 4,
+
+    /** Max ms to wait for the competition count to stabilize (stop updating) */
+    countStabilizeTimeout: 4000,
+
+    /** Max ms to wait for new grid cards to appear after a scroll */
+    gridGrowTimeout: 4000,
 
     /** Polling fallback interval (used if MutationObserver misses) */
     pollInterval: 600,

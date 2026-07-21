@@ -72,6 +72,57 @@ export function isJunkTag(t) {
 }
 
 /**
+ * Decide whether a tag read is "complete".
+ *   • If the page states a total (targetCount) → complete once we reach it.
+ *   • Otherwise → complete once we have a non-zero count that is UNCHANGED
+ *     from the previous attempt (stable across two consecutive reads).
+ * A stable count of 0 is never "complete" — that was the bug where an
+ * empty/half-rendered list was accepted as final.
+ */
+export function isTagReadComplete(count, prevCount, targetCount) {
+  if (targetCount && targetCount > 0) return count >= targetCount;
+  return count > 0 && count === prevCount;
+}
+
+/**
+ * Retry an "expand + read tags" attempt until the result is complete or
+ * the attempt budget is exhausted, with backoff between tries. This is the
+ * pure control logic behind content.js::getDetailData's retry loop (which
+ * implements the identical algorithm inline because it is an injected
+ * classic script and cannot import ES modules — keep the two in sync).
+ *
+ * Under simulated slow loading (attemptFn returns a count that grows across
+ * calls as the DOM lazily renders), this converges to a complete result
+ * instead of giving up on the first, partial read.
+ *
+ * @param {object}   o
+ * @param {function} o.attemptFn    async (attempt:number) => number  (tags collected this pass)
+ * @param {number|null} o.targetCount  page's stated tag total, if known
+ * @param {number}   [o.maxAttempts=4]
+ * @param {function} [o.backoff]     (attempt:number) => ms
+ * @param {function} [o.sleep]
+ * @returns {Promise<{count:number, complete:boolean, attempts:number}>}
+ */
+export async function retryUntilComplete({
+  attemptFn,
+  targetCount,
+  maxAttempts = 4,
+  backoff = (n) => 300 * n,
+  sleep = (ms) => new Promise(r => setTimeout(r, ms))
+}) {
+  let count = 0, complete = false, attempt = 0, prevCount = -1;
+  while (attempt < maxAttempts) {
+    attempt++;
+    count = await attemptFn(attempt);
+    complete = isTagReadComplete(count, prevCount, targetCount);
+    if (complete) break;
+    prevCount = count;
+    if (attempt < maxAttempts) await sleep(backoff(attempt));
+  }
+  return { count, complete, attempts: attempt };
+}
+
+/**
  * Drive the "scrape N unique videos with complete tags" loop.
  *
  * The caller supplies async I/O closures; this function owns all the

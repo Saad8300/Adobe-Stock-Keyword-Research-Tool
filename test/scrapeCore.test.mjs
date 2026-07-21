@@ -23,7 +23,8 @@
  */
 
 import {
-  extractAssetId, cleanTitle, cleanTag, isJunkTag, runScrapeLoop
+  extractAssetId, cleanTitle, cleanTag, isJunkTag, runScrapeLoop,
+  isTagReadComplete, retryUntilComplete
 } from '../utils/scrapeCore.js';
 
 let passed = 0, failed = 0;
@@ -184,6 +185,69 @@ await (async () => {
   const r = await runScrapeLoop({ videoCount: 10, fetchCards, fetchDetail, deadlineMs: 1000, now });
   assert(r.deadlineHit || r.videos.length < 10, 'deadline stops the loop');
   assert(r.reason !== null, 'reports a partial reason on deadline');
+})();
+
+// ── 11. isTagReadComplete (completion decision) ────────────────
+(() => {
+  assert(isTagReadComplete(45, 40, 45), 'reaches stated target → complete');
+  assert(isTagReadComplete(50, 10, 45), 'exceeds stated target → complete');
+  assert(!isTagReadComplete(40, 40, 45), 'below target even if stable → NOT complete');
+  assert(!isTagReadComplete(0, 0, null), 'stable count of 0 is NEVER complete (the bug)');
+  assert(isTagReadComplete(20, 20, null), 'no target + stable non-zero → complete');
+  assert(!isTagReadComplete(20, 10, null), 'no target + still growing → NOT complete');
+})();
+
+// A no-op sleep so retry tests run instantly (we assert on convergence,
+// not wall-clock timing).
+const fastSleep = () => Promise.resolve();
+
+// ── 12. retryUntilComplete converges under SIMULATED SLOW LOAD ──
+await (async () => {
+  // The tag list lazy-renders: 0 tags on the first read, then it fills in.
+  // A single-check implementation would have returned 0/partial; the retry
+  // loop must keep going until it reaches the stated total of 45.
+  const counts = [0, 12, 30, 45];
+  const r = await retryUntilComplete({
+    attemptFn: async (n) => counts[n - 1],
+    targetCount: 45, maxAttempts: 4, sleep: fastSleep
+  });
+  eq(r.count, 45, 'eventually reads the full 45 tags');
+  eq(r.complete, true, 'marked complete once target met');
+  eq(r.attempts, 4, 'took the retries it needed (did not give up early)');
+})();
+
+// ── 13. retryUntilComplete: fast page completes on attempt 1 ───
+await (async () => {
+  const r = await retryUntilComplete({
+    attemptFn: async () => 45, targetCount: 45, maxAttempts: 4, sleep: fastSleep
+  });
+  eq(r.attempts, 1, 'fast page needs only one attempt');
+  eq(r.complete, true, 'complete immediately');
+})();
+
+// ── 14. retryUntilComplete: no stated total, waits for STABLE ──
+await (async () => {
+  // Count grows then stabilizes; must confirm stability before accepting.
+  const counts = [10, 22, 30, 30];
+  const r = await retryUntilComplete({
+    attemptFn: async (n) => counts[n - 1],
+    targetCount: null, maxAttempts: 4, sleep: fastSleep
+  });
+  eq(r.count, 30, 'settles on the stable count');
+  eq(r.complete, true, 'complete once stable across two reads');
+  eq(r.attempts, 4, 'confirmed stability rather than trusting first read');
+})();
+
+// ── 15. retryUntilComplete: never reaches target → partial, flagged ──
+await (async () => {
+  // Genuinely fewer tags than the (misread) target — must NOT hang; must
+  // return the best result with complete=false so the caller can flag it.
+  const r = await retryUntilComplete({
+    attemptFn: async () => 12, targetCount: 45, maxAttempts: 4, sleep: fastSleep
+  });
+  eq(r.attempts, 4, 'exhausts the attempt budget');
+  eq(r.complete, false, 'reports incomplete rather than pretending success');
+  eq(r.count, 12, 'still returns the best data it got');
 })();
 
 // ── Summary ────────────────────────────────────────────────────

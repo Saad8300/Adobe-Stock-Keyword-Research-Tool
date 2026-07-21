@@ -227,43 +227,48 @@ function initContent() {
   // ──────────────────────────────────────────────────────────────
   async function getResultCount() {
     const { timing, resultCount: selectors } = SEL;
-    let countEl = null;
 
-    // 1. Wait for a known count element
+    // Re-read the current count value from the DOM on demand. The element
+    // reference can be replaced during React updates, so we re-query each
+    // time rather than caching the node.
+    const readCount = () => {
+      let el = firstMatch(selectors.filter(s => s !== '__TEXT_WALK__')) || textWalkForCount();
+      if (!el) return null;
+      const m = (el.textContent || '').match(/([\d,]+)/);
+      if (!m) return null;
+      const n = parseInt(m[1].replace(/,/g, ''), 10);
+      return isNaN(n) ? null : n;
+    };
+
+    // 1. Wait for a known count element to appear (condition-based).
     try {
-      countEl = await waitForElement(
-        selectors.filter(s => s !== '__TEXT_WALK__'),
-        timing.resultCountTimeout
-      );
+      await waitForElement(selectors.filter(s => s !== '__TEXT_WALK__'), timing.resultCountTimeout);
     } catch (_) {
-      // Timeout — fall through to text walk
+      // Timeout — the text-walk inside readCount() may still find it.
     }
 
-    // 2. Text-walk fallback: scan all visible text for "N results" pattern
-    if (!countEl) {
-      countEl = textWalkForCount();
+    // 2. STABILIZE: the count often shows a placeholder / partial number
+    // while the filtered query resolves. Poll until the parsed value is
+    // unchanged across two consecutive reads (or a generous timeout), so
+    // we never record a mid-update figure. This is the same "wait for
+    // completion, not a fixed timer" principle applied to the count step.
+    const deadline = Date.now() + (timing.countStabilizeTimeout || 4000);
+    let prev = null, count = null, reads = 0;
+    while (Date.now() < deadline) {
+      const v = readCount();
+      reads++;
+      if (v != null && v === prev) { count = v; break; }
+      prev = v;
+      await sleep(300);
     }
+    if (count == null) count = prev; // accept the last read if it never fully settled
 
-    if (!countEl) {
-      return { error: 'Could not locate result count element. ' +
+    if (count == null) {
+      return { error: 'Could not locate/parse result count element. ' +
         'Adobe Stock may have changed their UI — update resultCount selectors in config/selectors.js.' };
     }
 
-    const rawText = (countEl.textContent || '').trim();
-    console.log('[content] Result count raw text:', rawText);
-
-    // Parse: "12,345 results", "About 12,345 Videos", "12345", etc.
-    const match = rawText.match(/([\d,]+)/);
-    if (!match) {
-      return { error: `Could not parse a number from result count text: "${rawText}"` };
-    }
-
-    const count = parseInt(match[1].replace(/,/g, ''), 10);
-    if (isNaN(count)) {
-      return { error: `Parsed NaN from count text: "${rawText}"` };
-    }
-
-    console.log('[content] Parsed competition count:', count);
+    dbg(`competition count stabilized at ${count} after ${reads} read(s)`);
     return { count };
   }
 
@@ -299,7 +304,7 @@ function initContent() {
     const cards = [];
     const seenUrls = new Set();
     const max = timing.maxScrollAttempts;
-    const pause = timing.scrollPauseMs;
+    const domCardCount = () => allMatches(SEL.resultCard).length;
     let stagnantScrolls = 0; // consecutive scrolls that loaded no new cards
 
     const collectFromDom = () => {
@@ -337,6 +342,7 @@ function initContent() {
 
       dbg(`scrapeVideoCards scroll ${attempt + 1}/${max}: ${cards.length}/${videoCount} unique`);
 
+      const domBefore = domCardCount();
       const grid = firstMatch(SEL.resultsGrid);
       if (grid) grid.scrollBy({ top: grid.clientHeight * 2, behavior: 'smooth' });
       window.scrollBy({ top: window.innerHeight * 1.5, behavior: 'smooth' });
@@ -344,7 +350,11 @@ function initContent() {
       const loadMoreBtn = findLoadMoreButton();
       if (loadMoreBtn) { dbg('clicking load-more button'); loadMoreBtn.click(); }
 
-      await new Promise(r => setTimeout(r, pause));
+      // Condition-based wait: give the grid a chance to lazy-render NEW cards
+      // rather than sleeping a flat interval that may be too short (missing
+      // cards) or needlessly long. Falls through on timeout so the stagnation
+      // counter can still decide the grid is truly exhausted.
+      await waitFor(() => domCardCount() > domBefore, timing.gridGrowTimeout, 200);
     }
 
     dbg(`scrapeVideoCards collected ${cards.length} unique cards`);
@@ -444,58 +454,129 @@ function initContent() {
   // ──────────────────────────────────────────────────────────────
   async function getDetailData() {
     const { timing } = SEL;
+    const t0 = Date.now();
     const assetId = extractAssetId(location.href);
     dbg('getDetailData ▶ id=' + assetId, location.href);
 
-    // ── 1. Wait for the page's core content (title OR tag list) ──────
-    // Detail pages are React SPAs; the tag list renders after hydration.
-    try {
-      await waitForElement(
-        [...SEL.detailTitle, ...SEL.detailTagsContainer, 'a[href*="?k="]'],
-        timing.detailLoadTimeout
-      );
-    } catch (_) {
-      dbg('  core content wait timed out — proceeding with whatever is present');
-    }
+    // ── 1. Wait for the TAGS REGION itself to render — NOT just page load ──
+    // The generic tab "load complete" event fires before React lazy-renders
+    // the keyword list. Reading here (instead of waiting for the tags region
+    // specifically) is the root cause of the intermittent partial-tags bug:
+    // fast responses had tags ready, slow ones didn't, so behaviour differed
+    // video-by-video. We now block on the actual tag elements appearing.
+    const ready = await waitForTagsReady(timing.detailLoadTimeout);
+    const readyMs = Date.now() - t0;
+    dbg(`  tags region ready=${ready} after ${readyMs}ms`);
 
     // ── 2. Expand the truncated title ("See More") and VERIFY ────────
     const titleExpanded = await expandTitle();
-    dbg('  title expand:', titleExpanded);
+    dbg('  title expand verified:', titleExpanded);
 
-    // ── 3. Read the expected tag count, expand the list, VERIFY ──────
+    // ── 3. Read the page's own stated tag count (the completion target) ──
     const targetTagCount = readTargetTagCount();
-    const tagExpansion = await expandTags(targetTagCount);
-    dbg('  tag expand:', tagExpansion);
 
-    // ── 4. Extract the clean title (button/toggle text stripped) ─────
+    // ── 4. Expand + read tags with RETRIES until the result is complete ──
+    // "Complete" = collected count reaches the page's stated total (if
+    // shown), otherwise a non-zero count that is stable across two passes.
+    // Each retry re-expands and waits for the DOM to settle, with backoff,
+    // so a slow render eventually succeeds instead of silently returning a
+    // partial list.
+    const maxAttempts = timing.tagRetryMax || 4;
+    let tags = [];
+    let complete = false;
+    let attempt = 0;
+    let prevCount = -1;
+
+    while (attempt < maxAttempts) {
+      attempt++;
+      await expandTags(targetTagCount);
+      // Block until the tag element count stops changing (or timeout).
+      await waitUntilStable(() => getTagElements().length, timing.tagStableTimeout, 200);
+      tags = collectTags();
+      const count = tags.length;
+
+      if (targetTagCount && targetTagCount > 0) {
+        complete = count >= targetTagCount;
+      } else {
+        // No stated total: require a non-zero count confirmed stable across
+        // two consecutive attempts before trusting it.
+        complete = count > 0 && count === prevCount;
+      }
+
+      dbg(`  tag attempt ${attempt}/${maxAttempts}: collected=${count}` +
+          (targetTagCount ? `/${targetTagCount}` : ' (no stated total)') +
+          ` complete=${complete}`);
+
+      if (complete) break;
+      prevCount = count;
+      if (attempt < maxAttempts) {
+        const backoff = 300 * attempt; // 300 → 600 → 900 ms
+        dbg(`  ↻ retrying tag read in ${backoff}ms (not yet complete)`);
+        await sleep(backoff);
+      }
+    }
+
+    // ── 5. Extract the clean title (button/toggle text stripped) ─────
     const title = extractDetailTitle();
-
-    // ── 5. Extract the fully-expanded tag list ───────────────────────
-    const tags = collectTags();
+    const elapsedMs = Date.now() - t0;
 
     dbg(`getDetailData ◀ id=${assetId} title="${title}" tags=${tags.length}` +
-        (targetTagCount ? `/${targetTagCount}` : ''));
-    return { assetId, title, tags, targetTagCount };
+        (targetTagCount ? `/${targetTagCount}` : '') +
+        ` complete=${complete} attempts=${attempt} readyMs=${readyMs} totalMs=${elapsedMs}`);
+
+    return { assetId, title, tags, targetTagCount, complete, attempts: attempt, readyMs, elapsedMs };
   }
 
-  /** Click the title "See More" toggle and confirm the text actually grew. */
+  /**
+   * Condition-based wait for the keyword/tag region to actually render.
+   * Resolves as soon as the dedicated tag container holds ≥1 tag element.
+   * Only if the container never appears do we accept page-wide keyword
+   * links as a last-resort signal. This is the explicit "tags section has
+   * rendered" check that must precede extraction (fixes the tab-ready vs
+   * content-ready race).
+   */
+  async function waitForTagsReady(timeoutMs) {
+    const containerReady = await waitFor(() => {
+      const c = firstMatch(SEL.detailTagsContainer);
+      return !!(c && allMatches(SEL.detailTagItem, c).length > 0);
+    }, timeoutMs, 150);
+    if (containerReady) return true;
+    // Container never rendered — fall back to any keyword-search links.
+    return getTagElements().length > 0;
+  }
+
+  /**
+   * Click the title "See More" toggle and confirm the text actually grew.
+   * Retries a couple of times because the toggle itself can be lazy-rendered
+   * (same timing race as the tags) — so a single check can miss it on slow
+   * loads, leaving a truncated title.
+   */
   async function expandTitle() {
     const titleEl = firstMatch(SEL.detailTitle);
     if (!titleEl) return false;
-    let btn = firstMatch(SEL.detailTitleExpandBtn) || findButtonByText(/see\s*more|show\s*more/i, titleEl.parentElement || document);
-    if (!btn || !isVisible(btn)) return false;
 
-    const before = titleEl.textContent.trim().length;
-    dbg('  clicking See More (title), len before =', before);
-    try { btn.click(); } catch (_) { return false; }
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const btn = firstMatch(SEL.detailTitleExpandBtn) ||
+                  findButtonByText(/see\s*more|show\s*more/i, titleEl.parentElement || document);
+      if (!btn || !isVisible(btn)) {
+        // No (more) toggle → nothing to expand OR already expanded.
+        return attempt > 1;
+      }
 
-    // Success = title grew OR the toggle button disappeared.
-    const ok = await waitFor(
-      () => titleEl.textContent.trim().length > before || !isVisible(btn),
-      SEL.timing.expandVerifyTimeout
-    );
-    if (!ok) dbg('  ⚠ See More clicked but no verified change');
-    return ok;
+      const before = titleEl.textContent.trim().length;
+      dbg(`  clicking See More (title) attempt ${attempt}, len before =`, before);
+      try { btn.click(); } catch (_) { return false; }
+
+      // Success = title grew OR the toggle disappeared.
+      const ok = await waitFor(
+        () => titleEl.textContent.trim().length > before || !isVisible(btn),
+        SEL.timing.expandVerifyTimeout
+      );
+      if (ok) return true;
+      dbg('  ⚠ See More clicked but no verified change — retrying');
+      await sleep(250);
+    }
+    return false;
   }
 
   /** Parse the "N keywords" indicator, if present. */
@@ -531,8 +612,8 @@ function initContent() {
       dbg('  no tag-expand toggle found (list may already be full)');
     }
 
-    // Let lazily-rendered tags settle.
-    const finalCount = await waitUntilStable(() => getTagElements().length, 2000);
+    // Let lazily-rendered tags settle before the caller reads them.
+    const finalCount = await waitUntilStable(() => getTagElements().length, SEL.timing.tagStableTimeout, 200);
     return { before, after: finalCount, clicked: !!(btn && isVisible(btn)) };
   }
 
