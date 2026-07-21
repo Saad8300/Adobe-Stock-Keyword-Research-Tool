@@ -218,7 +218,7 @@ function initContent() {
   // ──────────────────────────────────────────────────────────────
   // ACTION: scrape_video_cards
   // Scroll the results grid to load ≥ videoCount cards,
-  // then collect title + detail URL from each.
+  // then collect title + detail URL from each. Deduplicates by URL.
   // ──────────────────────────────────────────────────────────────
   async function scrapeVideoCards(videoCount) {
     const { timing } = SEL;
@@ -230,42 +230,31 @@ function initContent() {
       return { error: `Grid did not populate: ${e.message}` };
     }
 
-    // Scroll to lazy-load until we have enough cards
-    await scrollForCards(videoCount, timing);
-
-    const cardEls = allMatches(SEL.resultCard);
-    console.log(`[content] ${cardEls.length} cards found in DOM`);
-
     const cards = [];
-    for (const card of cardEls) {
-      if (cards.length >= videoCount) break;
-      const title     = extractTitle(card);
-      const detailUrl = extractDetailUrl(card);
-      if (title || detailUrl) {
-        cards.push({ title, detailUrl });
-      }
-    }
-
-    console.log(`[content] Collected ${cards.length} cards`);
-    return { cards };
-  }
-
-  /**
-   * Scroll the results container progressively until we have
-   * targetCount cards OR hit maxScrollAttempts.
-   * Also tries clicking "Load More" buttons if present.
-   */
-  async function scrollForCards(targetCount, timing) {
-    const max   = timing.maxScrollAttempts;
+    const seenUrls = new Set();
+    const max = timing.maxScrollAttempts;
     const pause = timing.scrollPauseMs;
 
     for (let attempt = 0; attempt < max; attempt++) {
-      const cards = allMatches(SEL.resultCard);
-      if (cards.length >= targetCount) {
-        console.log(`[content] Scroll done: ${cards.length}/${targetCount} cards`);
-        return;
+      const cardEls = allMatches(SEL.resultCard);
+      
+      // Extract unique cards from current DOM
+      for (const card of cardEls) {
+        if (cards.length >= videoCount) break;
+        const detailUrl = extractDetailUrl(card);
+        if (detailUrl && !seenUrls.has(detailUrl)) {
+          seenUrls.add(detailUrl);
+          const title = extractTitle(card);
+          cards.push({ title, detailUrl });
+        }
       }
-      console.log(`[content] Scroll ${attempt + 1}/${max}: ${cards.length}/${targetCount} cards`);
+
+      if (cards.length >= videoCount) {
+        console.log(`[content] Scrape done: ${cards.length}/${videoCount} unique cards`);
+        break;
+      }
+      
+      console.log(`[content] Scroll ${attempt + 1}/${max}: ${cards.length}/${videoCount} unique cards`);
 
       // Scroll results container (preferred) and window
       const grid = firstMatch(SEL.resultsGrid);
@@ -281,6 +270,9 @@ function initContent() {
 
       await new Promise(r => setTimeout(r, pause));
     }
+
+    console.log(`[content] Collected ${cards.length} unique cards`);
+    return { cards };
   }
 
   function findLoadMoreButton() {
@@ -367,6 +359,29 @@ function initContent() {
   async function getDetailTags() {
     const { timing } = SEL;
     const tags = new Set();
+    let fullTitle = '';
+
+    // BUG 4 FIX: Extract full title from detail page
+    try {
+      const titleEl = firstMatch(SEL.detailTitle);
+      if (titleEl) {
+        fullTitle = titleEl.textContent.trim();
+      }
+    } catch (_) {}
+
+    // BUG 3 FIX: Click "Show more tags" to expand the list before scraping
+    try {
+      const expandBtn = firstMatch(SEL.detailTagsExpandBtn);
+      if (expandBtn) {
+        console.log('[content] Clicking "Show more tags" button...');
+        expandBtn.click();
+        
+        // Wait briefly for the DOM to update with new tags
+        for (let i = 0; i < 3; i++) {
+          await new Promise(r => setTimeout(r, 600));
+        }
+      }
+    } catch (_) {}
 
     // Strategy 1: Wait for the tags container, then collect links
     try {
@@ -410,8 +425,8 @@ function initContent() {
       });
     }
 
-    console.log(`[content] Detail page tags (${tags.size}):`, [...tags].slice(0, 5));
-    return { tags: [...tags] };
+    console.log(`[content] Detail page tags (${tags.size}):`, [...tags].slice(0, 5), 'title:', fullTitle);
+    return { tags: [...tags], title: fullTitle };
   }
 
   function extractJsonLdTagsLocal(data, tagSet) {

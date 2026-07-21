@@ -197,9 +197,9 @@ async function closeWorkingTab() {
 // ══════════════════════════════════════════════════════════════
 
 /**
- * Try to extract tags from a detail page URL.
+ * Try to extract tags and title from a detail page URL.
  * @param {string} url — full URL of the asset detail page
- * @returns {Promise<string[]>}
+ * @returns {Promise<{tags: string[], title: string}>}
  */
 async function fetchTagsFromDetailPage(url) {
   // ── Strategy A: plain fetch ──────────────────────────────────
@@ -215,9 +215,20 @@ async function fetchTagsFromDetailPage(url) {
     if (res.ok) {
       const html = await res.text();
       const tags = parseTagsFromHtml(html);
+      
+      let title = '';
+      try {
+        // DOMParser is available in MV3 service workers only in very new Chrome versions,
+        // but we'll try basic regex fallback if DOMParser fails.
+        // Wait, DOMParser is NOT available in SW! 
+        // We'll just rely on Strategy B for title or use regex.
+        const match = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+        if (match) title = match[1].trim();
+      } catch (_) {}
+
       if (tags.length > 0) {
         console.log(`[bg] fetch() got ${tags.length} tags from ${url}`);
-        return tags;
+        return { tags, title };
       }
       // Zero tags from static parse — fall through to tab method
     }
@@ -230,34 +241,30 @@ async function fetchTagsFromDetailPage(url) {
 }
 
 /**
- * Parse tags from raw HTML string using DOMParser.
- * Uses multiple extraction strategies in decreasing reliability order.
+ * Parse tags from raw HTML string. Service workers don't have DOMParser.
  */
 function parseTagsFromHtml(html) {
-  const doc = new DOMParser().parseFromString(html, 'text/html');
   const tags = new Set();
-
-  // 1. Keyword links (most specific — stock.adobe.com/search?k=<tag>)
-  doc.querySelectorAll('a[href*="?k="], a[href*="/search?"]').forEach(a => {
-    const t = a.textContent.trim();
-    if (t && t.length > 1 && t.length < 80) tags.add(t);
-  });
-
-  // 2. Meta keywords tag
-  const meta = doc.querySelector('meta[name="keywords"]');
-  if (meta?.content) {
-    meta.content.split(',').forEach(k => {
+  
+  // Basic regex fallback since DOMParser isn't in Service Worker
+  // (We primarily rely on hidden tab for accuracy anyway)
+  const metaMatch = html.match(/<meta\s+name="keywords"\s+content="([^"]+)"/i);
+  if (metaMatch) {
+    metaMatch[1].split(',').forEach(k => {
       const t = k.trim();
       if (t) tags.add(t);
     });
   }
 
-  // 3. JSON-LD structured data
-  doc.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+  // Look for JSON-LD structured data
+  const jsonLdRegex = /<script\s+type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = jsonLdRegex.exec(html)) !== null) {
     try {
-      extractJsonLdTags(JSON.parse(s.textContent), tags);
+      const data = JSON.parse(match[1]);
+      extractJsonLdTags(data, tags);
     } catch (_) {}
-  });
+  }
 
   return [...tags];
 }
@@ -288,10 +295,13 @@ async function fetchTagsViaHiddenTab(url) {
     await sleep(1200); // let React finish
 
     const resp = await sendToContent(tabId, { action: 'get_detail_tags' }, 3);
-    return (resp && Array.isArray(resp.tags)) ? resp.tags : [];
+    return {
+      tags: (resp && Array.isArray(resp.tags)) ? resp.tags : [],
+      title: resp?.title || ''
+    };
   } catch (e) {
     console.warn('[bg] Hidden tab tag fetch failed:', e.message);
-    return [];
+    return { tags: [], title: '' };
   } finally {
     if (tabId) {
       try { await chrome.tabs.remove(tabId); } catch (_) {}
@@ -425,9 +435,12 @@ async function processKeyword(keyword, index, total) {
       });
 
       let tags = [];
+      let fullTitle = card.title || `Video ${i + 1}`;
       if (card.detailUrl) {
         try {
-          tags = await fetchTagsFromDetailPage(card.detailUrl);
+          const detailData = await fetchTagsFromDetailPage(card.detailUrl);
+          tags = detailData.tags;
+          if (detailData.title) fullTitle = detailData.title;
         } catch (e) {
           notify('log', {
             message: `  ⚠ Tag fetch failed for "${card.title || 'video ' + (i+1)}": ${e.message}`,
@@ -438,10 +451,26 @@ async function processKeyword(keyword, index, total) {
         await randomDelay(800, 2000);
       }
 
-      videos.push({ title: card.title || `Video ${i + 1}`, tags });
+      videos.push({ title: fullTitle, tags });
     }
 
     notify('scrape_progress', { keyword, scraped: videos.length, total: cards.length, step: 'Done' });
+    
+    // ── VALIDATION CHECK ──────────────────────────────────────────
+    if (videos.length < videoCount) {
+      notify('log', {
+        message: `  ⚠ Validation: only ${videos.length}/${videoCount} unique videos found (grid may have fewer results or max scroll reached)`,
+        type: 'error'
+      });
+      // Ensure we record the reason in the summary
+      result.skipReason = (result.skipReason ? result.skipReason + '; ' : '') + `Partial scrape: ${videos.length}/${videoCount} videos`;
+    } else {
+      notify('log', {
+        message: `  ✓ Validation: successfully scraped ${videos.length} unique videos`,
+        type: 'ok'
+      });
+    }
+
     result.videos = videos;
 
   } catch (err) {
@@ -583,6 +612,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             return;
           }
           const { keywords, settings } = msg.payload;
+          
+          notify('log', {
+            message: `Starting run: keyword(s)=${keywords.length}, min=${settings.minComp}, max=${settings.maxComp}, videos=${settings.videoCount}`,
+            type: 'info'
+          });
+
           await initRun({ keywords, settings });
           rt.status       = 'running';
           rt.keywords     = keywords;

@@ -252,6 +252,17 @@ window.ADOBE_STOCK_SELECTORS = {
     'a'
   ],
 
+  /**
+   * "Show more tags" / "+X more" button that expands the keyword list
+   * on asset detail pages.
+   */
+  detailTagsExpandBtn: [
+    '[data-cy="keywords-expand-button"]',
+    'button[class*="expand-keyword"]',
+    'button[class*="show-more"]',
+    'button[aria-expanded="false"][class*="keyword"]'
+  ],
+
   // ──────────────────────────────────────────────────────────────
   // SECTION D — UI FALLBACK SELECTORS (if URL params fail)
   // Used when Adobe Stock doesn't honour URL filter params and
